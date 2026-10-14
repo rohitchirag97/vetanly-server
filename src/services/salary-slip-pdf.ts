@@ -98,6 +98,18 @@ export const buildSalarySlipPdf = ({ item: i, run, organizationName }: SlipData)
     doc.moveDown(0.3);
     pair("Total deductions", m(i.totalDeductions), true);
     doc.moveDown();
+
+    // Expense claims paid back: outside gross and deductions, added to net pay.
+    if (Number(i.reimbursements) > 0) {
+      doc.font("Helvetica-Bold").fontSize(11).text("Reimbursements", left);
+      for (const line of i.reimbursementLines) {
+        doc.moveDown(0.3);
+        pair(line.label, m(line.amount));
+      }
+      doc.moveDown(0.3);
+      pair("Total reimbursements", m(i.reimbursements), true);
+      doc.moveDown();
+    }
     rule();
 
     doc.font("Helvetica-Bold").fontSize(14);

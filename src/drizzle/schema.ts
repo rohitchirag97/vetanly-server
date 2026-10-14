@@ -8,6 +8,7 @@ import {
   jsonb,
   numeric,
   pgTable,
+  primaryKey,
   time,
   timestamp,
   uniqueIndex,
@@ -28,7 +29,8 @@ export type EmploymentType =
   | "contractor"
   | "intern";
 
-export type PlatformOrganizationStatus = "active" | "suspended" | "pending_deletion";
+// deleted: data was erased after a scheduled deletion; the row stays only because GST invoices must be kept.
+export type PlatformOrganizationStatus = "active" | "suspended" | "pending_deletion" | "deleted";
 
 export type CompensationType = "hourly" | "daily" | "fixed_salary";
 
@@ -147,6 +149,15 @@ export const organizationsTable = pgTable("organizations", {
   suspendedAt: timestamp("suspended_at", { withTimezone: true }),
   // Existing organizations predate platform reporting, so their creation date stays unknown.
   createdAt: timestamp("created_at", { withTimezone: true }),
+  // Empty until the owner starts the 14-day free trial; the workspace stays locked until then.
+  // See services/billing-access.services.ts for every access state.
+  trialEndsAt: timestamp("trial_ends_at", { withTimezone: true }),
+  // Set when the owner asks to upgrade; cleared once a paid period is recorded.
+  upgradeRequestedAt: timestamp("upgrade_requested_at", { withTimezone: true }),
+  // Set when the owner pauses the organization (is_active false); cleared when they reactivate it.
+  deactivatedAt: timestamp("deactivated_at", { withTimezone: true }),
+  // With status pending_deletion: when the purge job erases the organization. The owner can cancel until then.
+  deletionScheduledAt: timestamp("deletion_scheduled_at", { withTimezone: true }),
 });
 
 export const platformNotesTable = pgTable(
@@ -194,6 +205,8 @@ export const platformAuditLogsTable = pgTable(
 );
 
 export type PlatformBillingPeriod = "monthly" | "annual";
+// public: listed on every owner's Billing page. custom: only for organizations it is offered to.
+export type PlatformPlanVisibility = "public" | "custom";
 export type PlatformSubscriptionStatus = "active" | "trial" | "past_due" | "cancelled";
 export type PlatformInvoiceStatus = "open" | "paid" | "void";
 export type PlatformInvoiceWhatsAppStatus = "not_sent" | "queued" | "sent" | "failed";
@@ -210,11 +223,26 @@ export const platformPlansTable = pgTable(
     includedEmployees: integer("included_employees").notNull().default(0),
     overagePrice: numeric("overage_price", { precision: 12, scale: 2 }).notNull().default("0"),
     features: jsonb("features").$type<string[]>().notNull().default([]),
+    visibility: varchar("visibility", { length: 16 }).$type<PlatformPlanVisibility>().notNull().default("public"),
     isActive: boolean("is_active").notNull().default(true),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [uniqueIndex("platform_plans_name_unique").on(table.name)],
+);
+
+/** Custom plans offered to one organization; its owner sees them on the Billing page. */
+export const platformPlanOffersTable = pgTable(
+  "platform_plan_offers",
+  {
+    planId: uuid("plan_id").notNull().references(() => platformPlansTable.id, { onDelete: "cascade" }),
+    organizationId: uuid("organization_id").notNull().references(() => organizationsTable.id, { onDelete: "cascade" }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.planId, table.organizationId] }),
+    index("platform_plan_offers_org_idx").on(table.organizationId),
+  ],
 );
 
 export const platformBillingProfilesTable = pgTable("platform_billing_profiles", {
@@ -241,6 +269,8 @@ export const platformSubscriptionsTable = pgTable(
     status: varchar("status", { length: 16 }).$type<PlatformSubscriptionStatus>().notNull().default("active"),
     startsAt: date("starts_at", { mode: "string" }).notNull().defaultNow(),
     nextBillingAt: date("next_billing_at", { mode: "string" }),
+    // Last day the organization has paid for, inclusive. Access stays full through this date.
+    paidUntil: date("paid_until", { mode: "string" }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
@@ -413,6 +443,123 @@ export const shiftsTable = pgTable(
   (table) => [
     uniqueIndex("shifts_org_id_id_unique").on(table.organizationId, table.id),
     uniqueIndex("shifts_org_name_unique").on(table.organizationId, table.name),
+  ],
+);
+
+/**
+ * Shift rotation (see services/roster.services.ts). The shift an employee works on a date is, in order:
+ * a roster override for that day, else their rotation pattern, else their default shift.
+ */
+
+/** One step of a rotation: a shift (or a day off when shiftId is null) repeated for some days. */
+export type ShiftRotationStep = { shiftId: string | null; days: number };
+
+export const shiftRotationsTable = pgTable(
+  "shift_rotations",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    organizationId: uuid("organization_id")
+      .notNull()
+      .references(() => organizationsTable.id),
+    name: varchar("name", { length: 100 }).notNull(),
+    // The steps in order; the cycle repeats after the last one.
+    pattern: jsonb("pattern").$type<ShiftRotationStep[]>().notNull(),
+    isActive: boolean("is_active").notNull().default(true),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [uniqueIndex("shift_rotations_org_name_unique").on(table.organizationId, table.name)],
+);
+
+/** Puts an employee on a rotation from a date. Ranges for one employee never overlap. */
+export const shiftRotationAssignmentsTable = pgTable(
+  "shift_rotation_assignments",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    organizationId: uuid("organization_id")
+      .notNull()
+      .references(() => organizationsTable.id),
+    rotationId: uuid("rotation_id")
+      .notNull()
+      .references(() => shiftRotationsTable.id, { onDelete: "cascade" }),
+    userOrganizationId: uuid("user_organization_id").notNull(),
+    startsOn: date("starts_on", { mode: "string" }).notNull(),
+    // Last day on this rotation, inclusive; null while it continues.
+    endsOn: date("ends_on", { mode: "string" }),
+    // Which day of the cycle startsOn falls on (0-based), so crews can be staggered.
+    cycleOffset: integer("cycle_offset").notNull().default(0),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    foreignKey({
+      name: "shift_rotation_assignments_employee_org_fk",
+      columns: [table.organizationId, table.userOrganizationId],
+      foreignColumns: [userOrganizationsTable.organizationId, userOrganizationsTable.id],
+    }),
+    index("shift_rotation_assignments_employee_idx").on(table.userOrganizationId, table.startsOn),
+  ],
+);
+
+/** A single day's shift set by hand or by an approved swap; shiftId null means a day off. */
+export const shiftRosterOverridesTable = pgTable(
+  "shift_roster_overrides",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    organizationId: uuid("organization_id")
+      .notNull()
+      .references(() => organizationsTable.id),
+    userOrganizationId: uuid("user_organization_id").notNull(),
+    date: date("date", { mode: "string" }).notNull(),
+    shiftId: uuid("shift_id"),
+    source: varchar("source", { length: 8 }).$type<"manual" | "swap">().notNull().default("manual"),
+    note: varchar("note", { length: 200 }),
+    createdByUserId: uuid("created_by_user_id").references(() => usersTable.id),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    foreignKey({
+      name: "shift_roster_overrides_employee_org_fk",
+      columns: [table.organizationId, table.userOrganizationId],
+      foreignColumns: [userOrganizationsTable.organizationId, userOrganizationsTable.id],
+    }),
+    uniqueIndex("shift_roster_overrides_employee_date_unique").on(table.userOrganizationId, table.date),
+    index("shift_roster_overrides_org_date_idx").on(table.organizationId, table.date),
+  ],
+);
+
+// The colleague accepts first, then a manager approves; either can turn it down.
+export type ShiftSwapStatus = "awaiting_colleague" | "awaiting_manager" | "approved" | "rejected" | "cancelled";
+
+/** Two employees exchange their shifts on one date. */
+export const shiftSwapRequestsTable = pgTable(
+  "shift_swap_requests",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    organizationId: uuid("organization_id")
+      .notNull()
+      .references(() => organizationsTable.id),
+    requesterMembershipId: uuid("requester_membership_id").notNull(),
+    colleagueMembershipId: uuid("colleague_membership_id").notNull(),
+    date: date("date", { mode: "string" }).notNull(),
+    reason: varchar("reason", { length: 300 }),
+    status: varchar("status", { length: 20 }).$type<ShiftSwapStatus>().notNull().default("awaiting_colleague"),
+    reviewedByUserId: uuid("reviewed_by_user_id").references(() => usersTable.id),
+    reviewNote: varchar("review_note", { length: 300 }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    foreignKey({
+      name: "shift_swap_requests_requester_org_fk",
+      columns: [table.organizationId, table.requesterMembershipId],
+      foreignColumns: [userOrganizationsTable.organizationId, userOrganizationsTable.id],
+    }),
+    foreignKey({
+      name: "shift_swap_requests_colleague_org_fk",
+      columns: [table.organizationId, table.colleagueMembershipId],
+      foreignColumns: [userOrganizationsTable.organizationId, userOrganizationsTable.id],
+    }),
+    index("shift_swap_requests_org_status_idx").on(table.organizationId, table.status),
   ],
 );
 
@@ -1064,6 +1211,67 @@ export type PayrollLoanLine = {
   amount: string;
 };
 
+export type PayrollReimbursementLine = {
+  claimId: string;
+  label: string;
+  amount: string;
+};
+
+export type ExpenseCategory =
+  | "travel"
+  | "fuel"
+  | "food"
+  | "accommodation"
+  | "phone_internet"
+  | "office_supplies"
+  | "client_meeting"
+  | "medical"
+  | "other";
+// pending -> approved -> paid; or pending -> rejected / cancelled (by the employee).
+export type ExpenseClaimStatus = "pending" | "approved" | "rejected" | "cancelled" | "paid";
+
+/**
+ * Money an employee spent for work and claims back. Approved claims are reimbursed in the next
+ * payroll run as a separate line outside gross pay (no PF, ESI or TDS), or marked paid outside payroll.
+ */
+export const expenseClaimsTable = pgTable(
+  "expense_claims",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    organizationId: uuid("organization_id")
+      .notNull()
+      .references(() => organizationsTable.id),
+    userOrganizationId: uuid("user_organization_id").notNull(),
+    category: varchar("category", { length: 24 }).$type<ExpenseCategory>().notNull(),
+    amount: numeric("amount", { precision: 12, scale: 2 }).notNull(),
+    currencyCode: varchar("currency_code", { length: 3 }).notNull(),
+    expenseDate: date("expense_date", { mode: "string" }).notNull(),
+    description: varchar("description", { length: 500 }).notNull(),
+    status: varchar("status", { length: 16 }).$type<ExpenseClaimStatus>().notNull().default("pending"),
+    receiptStorageKey: varchar("receipt_storage_key", { length: 300 }),
+    receiptName: varchar("receipt_name", { length: 150 }),
+    receiptContentType: varchar("receipt_content_type", { length: 100 }),
+    reviewedByUserId: uuid("reviewed_by_user_id").references(() => usersTable.id),
+    reviewedAt: timestamp("reviewed_at", { withTimezone: true }),
+    reviewNote: varchar("review_note", { length: 500 }),
+    // Set when a finalized payroll run reimbursed the claim; null when it was paid outside payroll.
+    payrollRunId: uuid("payroll_run_id"),
+    paidAt: timestamp("paid_at", { withTimezone: true }),
+    paymentNote: varchar("payment_note", { length: 200 }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    foreignKey({
+      name: "expense_claims_employee_org_fk",
+      columns: [table.organizationId, table.userOrganizationId],
+      foreignColumns: [userOrganizationsTable.organizationId, userOrganizationsTable.id],
+    }),
+    index("expense_claims_org_status_idx").on(table.organizationId, table.status),
+    index("expense_claims_org_employee_idx").on(table.organizationId, table.userOrganizationId),
+  ],
+);
+
 export type SalaryComponentKind = "earning" | "deduction";
 export type SalaryComponentCalc = "fixed" | "percent_basic";
 
@@ -1158,6 +1366,100 @@ export const employeeStatutoryProfilesTable = pgTable(
   ],
 );
 
+/**
+ * Income-tax declarations (see services/tax-declaration.services.ts). Each financial year an employee
+ * picks a regime and declares investments by section; proofs are uploaded and reviewed line by line.
+ * Monthly TDS uses declared amounts until the proof deadline, then verified amounts only.
+ */
+export type TaxDeclarationSection =
+  | "80C"
+  | "80CCD1B"
+  | "80D_SELF"
+  | "80D_PARENTS"
+  | "HRA"
+  | "24B"
+  | "80E"
+  | "80TTA"
+  | "PREVIOUS_EMPLOYER";
+export type TaxDeclarationItemStatus = "pending" | "accepted" | "rejected";
+
+/** Window settings per organization and financial year; defaults apply when there is no row. */
+export const taxDeclarationSettingsTable = pgTable(
+  "tax_declaration_settings",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    organizationId: uuid("organization_id")
+      .notNull()
+      .references(() => organizationsTable.id),
+    // Financial year label, e.g. "2026-27".
+    financialYear: varchar("financial_year", { length: 7 }).notNull(),
+    // Last day employees can add or change declarations; null keeps them open until the proof deadline.
+    declarationClosesOn: date("declaration_closes_on", { mode: "string" }),
+    // Last day to upload proofs. After it, only verified amounts reduce TDS.
+    proofDeadline: date("proof_deadline", { mode: "string" }).notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [uniqueIndex("tax_declaration_settings_org_fy_unique").on(table.organizationId, table.financialYear)],
+);
+
+export const taxDeclarationsTable = pgTable(
+  "tax_declarations",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    organizationId: uuid("organization_id")
+      .notNull()
+      .references(() => organizationsTable.id),
+    userOrganizationId: uuid("user_organization_id").notNull(),
+    financialYear: varchar("financial_year", { length: 7 }).notNull(),
+    taxRegime: varchar("tax_regime", { length: 4 }).$type<TaxRegime>().notNull().default("new"),
+    // Raise the 80D limits from 25,000 to 50,000 for the employee and for parents aged 60 or more.
+    seniorSelf: boolean("senior_self").notNull().default(false),
+    seniorParents: boolean("senior_parents").notNull().default(false),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    foreignKey({
+      name: "tax_declarations_employee_org_fk",
+      columns: [table.organizationId, table.userOrganizationId],
+      foreignColumns: [userOrganizationsTable.organizationId, userOrganizationsTable.id],
+    }),
+    uniqueIndex("tax_declarations_employee_fy_unique").on(table.userOrganizationId, table.financialYear),
+    index("tax_declarations_org_fy_idx").on(table.organizationId, table.financialYear),
+  ],
+);
+
+export const taxDeclarationItemsTable = pgTable(
+  "tax_declaration_items",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    organizationId: uuid("organization_id")
+      .notNull()
+      .references(() => organizationsTable.id),
+    declarationId: uuid("declaration_id")
+      .notNull()
+      .references(() => taxDeclarationsTable.id, { onDelete: "cascade" }),
+    section: varchar("section", { length: 20 }).$type<TaxDeclarationSection>().notNull(),
+    // What it is within the section, e.g. "ppf" or "lic" under 80C.
+    kind: varchar("kind", { length: 40 }).notNull(),
+    description: varchar("description", { length: 200 }),
+    declaredAmount: numeric("declared_amount", { precision: 12, scale: 2 }).notNull(),
+    // Section-specific facts: monthly rent and landlord for HRA, lender for home loans, TDS for a previous employer.
+    details: jsonb("details").$type<Record<string, string | number | boolean | null>>().notNull().default({}),
+    status: varchar("status", { length: 12 }).$type<TaxDeclarationItemStatus>().notNull().default("pending"),
+    verifiedAmount: numeric("verified_amount", { precision: 12, scale: 2 }),
+    reviewNote: varchar("review_note", { length: 500 }),
+    reviewedByUserId: uuid("reviewed_by_user_id").references(() => usersTable.id),
+    reviewedAt: timestamp("reviewed_at", { withTimezone: true }),
+    proofStorageKey: varchar("proof_storage_key", { length: 300 }),
+    proofName: varchar("proof_name", { length: 150 }),
+    proofUploadedAt: timestamp("proof_uploaded_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [index("tax_declaration_items_declaration_idx").on(table.declarationId)],
+);
+
 export const payrollRunsTable = pgTable(
   "payroll_runs",
   {
@@ -1237,6 +1539,9 @@ export const payrollItemsTable = pgTable(
       .notNull()
       .default([]),
     loanLines: jsonb("loan_lines").$type<PayrollLoanLine[]>().notNull().default([]),
+    // Approved expense claims paid back with this salary. Added to net pay, outside gross and deductions.
+    reimbursements: numeric("reimbursements", { precision: 12, scale: 2 }).notNull().default("0"),
+    reimbursementLines: jsonb("reimbursement_lines").$type<PayrollReimbursementLine[]>().notNull().default([]),
     statutory: jsonb("statutory").$type<StatutoryBreakup>(),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()

@@ -49,3 +49,10 @@ export const incrementWithExpiry = async (key: string, windowSeconds: number) =>
     if (count === 1) await client.expire(key, windowSeconds);
     return count;
   });
+
+/** Sets the key only if it does not exist yet. Returns false when it already did, which makes it a cooldown lock. */
+export const setIfAbsent = async (key: string, value: string, expireInSeconds: number) =>
+  withRedis(async (client) => (await client.set(key, value, "EX", expireInSeconds, "NX")) === "OK");
+
+/** Seconds until the key expires; 0 when it is missing. */
+export const secondsLeft = async (key: string) => withRedis(async (client) => Math.max(0, await client.ttl(key)));

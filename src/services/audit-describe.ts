@@ -226,6 +226,47 @@ const describers: Record<string, Describe> = {
     text: `sent the loan NOC of ${who(t)} on WhatsApp`,
   }),
 
+  "POST /expenses": () => ({ text: "submitted an expense claim" }),
+  "POST /expenses/:claimId/cancel": () => ({ text: "cancelled their expense claim" }),
+  "PATCH /expenses/:claimId/review": ({ body }) => ({
+    text: `${str(body.status) ?? "reviewed"} an expense claim`,
+    extra: { reason: str(body.note) },
+  }),
+  "POST /expenses/:claimId/paid": () => ({ text: "marked an expense claim as paid outside payroll" }),
+
+  "PUT /tax-declarations/mine": ({ body }) => ({
+    text: `saved their tax declaration (${str(body.taxRegime) === "old" ? "old" : "new"} regime, FY ${str(body.financialYear) ?? ""})`,
+  }),
+  "POST /tax-declarations/mine/items": ({ body }) => ({ text: `declared a ${str(body.section) ?? ""} tax-saving item` }),
+  "PATCH /tax-declarations/items/:itemId": () => ({ text: "changed a tax declaration item" }),
+  "DELETE /tax-declarations/items/:itemId": () => ({ text: "removed a tax declaration item" }),
+  "POST /tax-declarations/items/:itemId/proof": () => ({ text: "uploaded a tax declaration proof" }),
+  "PATCH /tax-declarations/items/:itemId/review": ({ body }) => ({
+    text: `${str(body.status) ?? "reviewed"} a tax declaration item`,
+    extra: { reason: str(body.note) },
+  }),
+  "PUT /tax-declarations/settings": ({ body }) => ({
+    text: `set the tax declaration deadlines for FY ${str(body.financialYear) ?? ""}`,
+  }),
+
+  "POST /roster/rotations": ({ body }) => ({ text: `created shift rotation "${str(body.name) ?? ""}"` }),
+  "PUT /roster/rotations/:rotationId": ({ body }) => ({ text: `updated shift rotation "${str(body.name) ?? ""}"` }),
+  "DELETE /roster/rotations/:rotationId": () => ({ text: "deleted a shift rotation" }),
+  "POST /roster/assign": ({ body }) => ({
+    text: `put ${Array.isArray(body.employeeIds) ? body.employeeIds.length : 0} employee(s) on a shift rotation from ${str(body.startsOn) ?? ""}`,
+  }),
+  "POST /roster/end": ({ body }) => ({ text: `took employee(s) off their shift rotation from ${str(body.fromDate) ?? ""}` }),
+  "PUT /roster/override": ({ body }) => ({
+    text: body.clear ? `cleared a roster change on ${str(body.date) ?? ""}` : `changed a roster shift on ${str(body.date) ?? ""}`,
+  }),
+  "POST /roster/swaps": ({ body }) => ({ text: `asked a colleague to swap shifts on ${str(body.date) ?? ""}` }),
+  "PATCH /roster/swaps/:swapId/respond": ({ body }) => ({ text: `${body.accept ? "accepted" : "declined"} a shift swap request` }),
+  "POST /roster/swaps/:swapId/cancel": () => ({ text: "cancelled their shift swap request" }),
+  "PATCH /roster/swaps/:swapId/review": ({ body }) => ({
+    text: `${body.approve ? "approved" : "rejected"} a shift swap`,
+    extra: { reason: str(body.note) },
+  }),
+
   "POST /attendance/manual": ({ t }) => ({ text: `marked attendance manually for ${who(t)}` }),
   "DELETE /face-template/employee/:employeeId": ({ t }) => ({ text: `revoked the face data of ${who(t)}` }),
 

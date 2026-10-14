@@ -26,9 +26,16 @@ import statutoryRoutes from "@/routes/statutory.route";
 import overtimeRoutes from "@/routes/overtime.route";
 import announcementRoutes from "@/routes/announcement.route";
 import platformRoutes from "@/routes/platform.route";
+import billingRoutes from "@/routes/billing.route";
+import onboardingRoutes from "@/routes/onboarding.route";
+import expenseRoutes from "@/routes/expense.route";
+import fileRoutes from "@/routes/file.route";
+import taxDeclarationRoutes from "@/routes/tax-declaration.route";
+import rosterRoutes from "@/routes/roster.route";
 import { auditMiddleware } from "@/middleware/audit.middleware";
 import { ensureAuditLogGuards } from "@/services/audit.services";
 import { pruneNotifications } from "@/services/notification.services";
+import { purgeDueOrganizations } from "@/services/organization-lifecycle.services";
 import { registerShutdownHandlers } from "@/lifecycle/shutdown";
 
 const app: Hono = new Hono({ strict: false });
@@ -64,10 +71,19 @@ app.route(`${$apiPrefix}/statutory`, statutoryRoutes);
 app.route(`${$apiPrefix}/overtime`, overtimeRoutes);
 app.route(`${$apiPrefix}/announcements`, announcementRoutes);
 app.route(`${$apiPrefix}/platform`, platformRoutes);
+app.route(`${$apiPrefix}/billing`, billingRoutes);
+app.route(`${$apiPrefix}/onboarding`, onboardingRoutes);
+app.route(`${$apiPrefix}/expenses`, expenseRoutes);
+app.route(`${$apiPrefix}/files`, fileRoutes);
+app.route(`${$apiPrefix}/tax-declarations`, taxDeclarationRoutes);
+app.route(`${$apiPrefix}/roster`, rosterRoutes);
 
 await ensureAuditLogGuards();
 void pruneNotifications();
 setInterval(() => void pruneNotifications().catch(() => {}), 24 * 60 * 60 * 1000).unref();
+// Erases organizations whose 30-day deletion window has passed.
+void purgeDueOrganizations().catch((error) => console.error("Organization purge failed", error));
+setInterval(() => void purgeDueOrganizations().catch((error) => console.error("Organization purge failed", error)), 60 * 60 * 1000).unref();
 
 const server = Bun.serve({
   port: Number(env.PORT),

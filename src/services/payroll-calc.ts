@@ -55,6 +55,11 @@ export type CalcInput = {
   loans: CalcLoan[];
   /** Approved overtime minutes by date; only used when approval is required. */
   overtimeApprovals?: Map<string, number>;
+  /**
+   * Per-date work or off from the shift roster, for employees on a rotation or with day overrides.
+   * A rostered date replaces the company weekly off for that date; dates not listed keep it.
+   */
+  rosterDays?: Map<string, "work" | "off">;
   statutory?: { settings: StatutorySettings; employee: EmployeeStatutory; ytd: YearToDate };
 };
 
@@ -102,7 +107,9 @@ export const eachDate = (from: string, to: string): string[] => {
 
 /**
  * Pay rules:
- * - Weekly-off days are not working days. Every other day in the period is one.
+ * - Weekly-off days are not working days. Every other day in the period is one. For employees on a
+ *   shift rotation, their rostered off days replace the weekly off, and rostered workdays count even
+ *   when they fall on the company weekly off.
  * - Company holidays are skipped entirely, unless the organization pays holidays: then
  *   each counts as a working day and a fully payable one (daily and hourly staff get a day's pay).
  * - A day with punches follows its attendance status (present, half day, absent).
@@ -144,7 +151,9 @@ export const calculatePayroll = (input: CalcInput): CalcResult => {
   const holidaySet = new Set(input.holidays);
 
   for (const date of eachDate(input.periodStart, input.periodEnd)) {
-    if (settings.weeklyOffDays.includes(weekdayOf(date))) continue;
+    const rostered = input.rosterDays?.get(date);
+    if (rostered === "off") continue;
+    if (rostered !== "work" && settings.weeklyOffDays.includes(weekdayOf(date))) continue;
     if (holidaySet.has(date)) {
       if (settings.paidHolidays) {
         workingDays += 1;

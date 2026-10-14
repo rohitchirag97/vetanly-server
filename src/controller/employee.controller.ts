@@ -9,6 +9,7 @@ import {
 import { sendResponse } from "@/utils/response";
 import { withBody } from "@/utils/controller";
 import { respond } from "@/utils/result";
+import { requireFullAccess } from "@/services/billing-access.services";
 import {
   createEmployeeSchema,
   bulkCheckEmployeesSchema,
@@ -152,6 +153,11 @@ export const updateEmployeeStatusController = async (
     return sendResponse(c, "error", "Employee ID is required", null, 400);
   }
 
+  if (parsed.data.isActive) {
+    const billing = await requireFullAccess(parsed.data.organizationId);
+    if (!billing.ok) return respond(c, billing, "");
+  }
+
   const result = await setEmployeeMembershipActive(
     employeeId,
     parsed.data.organizationId,
@@ -233,6 +239,8 @@ export const bulkCreateEmployeesController = async (c: Context): Promise<Respons
   }
 
   const { organizationId, employees } = parsed.data;
+  const billing = await requireFullAccess(organizationId);
+  if (!billing.ok) return respond(c, billing, "");
   const seenPhones = new Set<string>();
   const results: { row: number; phone: string; status: string; employeeId?: string }[] = [];
 
@@ -284,6 +292,9 @@ export const createEmployeeController = async (c: Context): Promise<Response> =>
       400,
     );
   }
+
+  const billing = await requireFullAccess(parsed.data.organizationId);
+  if (!billing.ok) return respond(c, billing, "");
 
   const result = await createEmployeeForOrganization(
     parsed.data,

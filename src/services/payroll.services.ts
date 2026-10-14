@@ -24,6 +24,10 @@ import { notify } from "@/services/notification.services";
 import { enqueueSalarySlipWhatsApp } from "@/queue/producer/sendSalarySlipWhatsApp";
 import { enqueueSalarySlipEmail } from "@/queue/producer/sendDocumentEmail";
 import { deliveryChannels } from "@/services/user.services";
+import { requireFullAccess } from "@/services/billing-access.services";
+import { CATEGORY_LABELS, loadReimbursableClaims, settleClaimsInPayroll } from "@/services/expense.services";
+import { loadDeclarationAdjustments } from "@/services/tax-declaration.services";
+import { loadRoster, type RosterEntry } from "@/services/roster.services";
 import { calculatePayroll, type CalcLoan, type CalcSettings } from "@/services/payroll-calc";
 import { parseWeeklyOff } from "@/services/payroll-settings.services";
 import { holidayDatesBetween } from "@/services/holiday.services";
@@ -36,6 +40,8 @@ import {
 import { fromCents, lockAndMeasure, toCents, totalDueCents } from "@/services/recoverable.services";
 import { fail, ok, type ServiceResult } from "@/utils/result";
 import type { generatePayrollSchema } from "@/validator/payroll.validator";
+import type { TaxRegime } from "@/drizzle/schema";
+import type { EmployeeStatutory, StatutorySettings, YearToDate } from "@/services/statutory-calc";
 
 export type PayrollItem = typeof items.$inferSelect;
 export type PayrollRunRow = typeof runs.$inferSelect;
@@ -110,6 +116,8 @@ export const generateRun = async (
 ) => {
   const access = await requireRole(organizationId, requesterId, MANAGER_ROLES);
   if (!access.ok) return access;
+  const billing = await requireFullAccess(organizationId);
+  if (!billing.ok) return billing;
 
   const [existing] = await db
     .select()
@@ -167,7 +175,7 @@ export const generateRun = async (
     return ready;
   });
 
-  const [attendance, leaveRows, loanRows, repaidRows, payrollPaid, holidays] = await Promise.all([
+  const [attendance, leaveRows, loanRows, repaidRows, payrollPaid, holidays, claimRows] = await Promise.all([
     computeDailyAttendance(organizationId, {
       from: input.periodStart,
       to: input.periodEnd,
@@ -214,6 +222,7 @@ export const generateRun = async (
         ),
       ),
     holidayDatesBetween(organizationId, input.periodStart, input.periodEnd),
+    loadReimbursableClaims(organizationId, input.periodEnd),
   ]);
 
   const repaidByLoan = new Map<string, number>();
@@ -230,6 +239,10 @@ export const generateRun = async (
         loadYearToDate(organizationId, input.periodStart, input.periodEnd),
       ])
     : [null, null];
+  // Employees who declared for this financial year: their regime, deductions and previous-employer income.
+  const declarations = statutoryActive ? await loadDeclarationAdjustments(organizationId, input.periodEnd) : null;
+  // Rotations and day overrides decide which days rostered employees work or have off.
+  const roster = await loadRoster(organizationId, input.periodStart, input.periodEnd, payable.map((e) => e.id));
 
   const approvalRows = settings.overtimeApprovalRequired
     ? await db
@@ -266,6 +279,15 @@ export const generateRun = async (
         outstandingCents: totalDueCents(l) - (repaidByLoan.get(l.id) ?? 0),
       }));
 
+    const reimbursementLines = claimRows
+      .filter((claim) => claim.userOrganizationId === e.id)
+      .map((claim) => ({
+        claimId: claim.id,
+        label: `${CATEGORY_LABELS[claim.category]} (${claim.expenseDate})`,
+        amount: Number(claim.amount).toFixed(2),
+      }));
+    const reimbursementCents = reimbursementLines.reduce((sum, line) => sum + toCents(line.amount), 0);
+
     const calc = calculatePayroll({
       periodStart: input.periodStart,
       periodEnd: input.periodEnd,
@@ -279,12 +301,13 @@ export const generateRun = async (
       holidays,
       leaves: leaveRows.filter((l) => l.userOrganizationId === e.id),
       loans,
+      rosterDays: rosterDaysFor(roster.byMembership.get(e.id)),
       overtimeApprovals: new Map(
         approvalRows.filter((r) => r.userOrganizationId === e.id).map((r) => [r.date, r.minutes]),
       ),
       statutory:
         profileMap && ytdMap
-          ? { settings: statutorySettings, employee: profileMap.get(e.id), ytd: ytdMap.get(e.id) }
+          ? withDeclaration(statutorySettings, profileMap.get(e.id), ytdMap.get(e.id), declarations?.get(e.id))
           : undefined,
     });
 
@@ -324,13 +347,16 @@ export const generateRun = async (
       })),
       loanDeduction: fromCents(calc.loanDeductionCents),
       totalDeductions: fromCents(calc.totalDeductionsCents),
-      netPay: fromCents(calc.netPayCents),
+      // Reimbursements are paid on top of net salary: outside gross, so no PF, ESI, PT or TDS applies.
+      netPay: fromCents(calc.netPayCents + reimbursementCents),
       statutory: calc.statutory,
       loanLines: calc.loanLines.map((l) => ({
         recoverableId: l.recoverableId,
         label: l.label,
         amount: fromCents(l.amountCents),
       })),
+      reimbursements: fromCents(reimbursementCents),
+      reimbursementLines,
     };
   });
 
@@ -381,8 +407,22 @@ export const deleteRun = async (organizationId: string, requesterId: string, run
 export const finalizeRun = async (organizationId: string, requesterId: string, runId: string) => {
   const access = await requireRole(organizationId, requesterId, MANAGER_ROLES);
   if (!access.ok) return access;
+  const billing = await requireFullAccess(organizationId);
+  if (!billing.ok) return billing;
 
-  const result = await db.transaction(async (tx): Promise<ServiceResult<null>> => {
+  const result = await finalizeInTransaction(organizationId, requesterId, runId).catch((error: unknown) => {
+    if (error instanceof FinalizeConflict) return fail("conflict", error.message);
+    throw error;
+  });
+  if (result.ok) await notifySlipsReady(organizationId, requesterId, runId);
+  return result;
+};
+
+/** Raised inside the finalize transaction to roll back everything it already wrote. */
+class FinalizeConflict extends Error {}
+
+const finalizeInTransaction = (organizationId: string, requesterId: string, runId: string) =>
+  db.transaction(async (tx): Promise<ServiceResult<null>> => {
     const [run] = await tx
       .select()
       .from(runs)
@@ -402,8 +442,8 @@ export const finalizeRun = async (organizationId: string, requesterId: string, r
         const locked = await lockAndMeasure(tx, organizationId, line.recoverableId);
         const amountCents = toCents(line.amount);
         if (!locked.ok || amountCents > locked.data.outstanding) {
-          return fail(
-            "conflict",
+          // Thrown, not returned: returning would commit the repayments already recorded for earlier employees.
+          throw new FinalizeConflict(
             `Loan balance changed for ${item.employeeName}. Regenerate the payroll and try again`,
           );
         }
@@ -431,32 +471,37 @@ export const finalizeRun = async (organizationId: string, requesterId: string, r
       }
     }
 
+    const claimIds = rows.flatMap((item) => item.reimbursementLines.map((line) => line.claimId));
+    if (!(await settleClaimsInPayroll(tx, organizationId, runId, claimIds))) {
+      // Throwing rolls back the loan repayments recorded above as well.
+      throw new FinalizeConflict("An expense claim in this payroll was cancelled or paid since it was generated. Regenerate the payroll and try again");
+    }
+
     await tx
       .update(runs)
       .set({ status: "finalized", finalizedAt: new Date(), finalizedByUserId: requesterId })
       .where(eq(runs.id, runId));
     return ok(null);
   });
-  if (result.ok) {
-    const [run] = await db
-      .select({ periodStart: runs.periodStart, periodEnd: runs.periodEnd })
-      .from(runs)
-      .where(eq(runs.id, runId))
-      .limit(1);
-    const recipients = await db
-      .select({ userId: items.userId })
-      .from(items)
-      .where(and(eq(items.organizationId, organizationId), eq(items.runId, runId)));
-    await notify({
-      organizationId,
-      userIds: recipients.map((row) => row.userId).filter((id) => id !== requesterId),
-      type: "payslip_ready",
-      title: "Your salary slip is ready",
-      body: run ? `Pay period ${run.periodStart} to ${run.periodEnd}` : undefined,
-      link: "/salary-slips",
-    });
-  }
-  return result;
+
+const notifySlipsReady = async (organizationId: string, requesterId: string, runId: string) => {
+  const [run] = await db
+    .select({ periodStart: runs.periodStart, periodEnd: runs.periodEnd })
+    .from(runs)
+    .where(eq(runs.id, runId))
+    .limit(1);
+  const recipients = await db
+    .select({ userId: items.userId })
+    .from(items)
+    .where(and(eq(items.organizationId, organizationId), eq(items.runId, runId)));
+  await notify({
+    organizationId,
+    userIds: recipients.map((row) => row.userId).filter((id) => id !== requesterId),
+    type: "payslip_ready",
+    title: "Your salary slip is ready",
+    body: run ? `Pay period ${run.periodStart} to ${run.periodEnd}` : undefined,
+    link: "/salary-slips",
+  });
 };
 
 export const listMySlips = async (organizationId: string, requesterId: string) => {
@@ -493,6 +538,8 @@ export const requestSlipWhatsApp = async (
 ): Promise<ServiceResult<null>> => {
   const slip = await getSlip(organizationId, requesterId, itemId);
   if (!slip.ok) return slip;
+  const billing = await requireFullAccess(organizationId);
+  if (!billing.ok) return billing;
   if (slip.data.run.status !== "finalized") {
     return fail("conflict", "Salary slip can be sent once the payroll is finalized");
   }
@@ -510,6 +557,8 @@ export const requestSlipEmail = async (
 ): Promise<ServiceResult<null>> => {
   const slip = await getSlip(organizationId, requesterId, itemId);
   if (!slip.ok) return slip;
+  const billing = await requireFullAccess(organizationId);
+  if (!billing.ok) return billing;
   if (slip.data.run.status !== "finalized") {
     return fail("conflict", "Salary slip can be sent once the payroll is finalized");
   }
@@ -580,4 +629,31 @@ export const getSlip = async (organizationId: string, requesterId: string, itemI
   }
   const { phone, email, emailVerified, ...slip } = row;
   return ok({ ...slip, delivery: deliveryChannels({ phone, email, emailVerified }) });
+};
+
+/**
+ * TDS inputs for one employee. A tax declaration for the year overrides the statutory profile's
+ * regime and deductions, and income and TDS from a previous employer count as earned this year.
+ */
+const withDeclaration = (
+  settings: StatutorySettings,
+  employee: EmployeeStatutory,
+  ytd: YearToDate,
+  declaration: { regime: TaxRegime; deductions: number; previousGross: number; previousTds: number } | undefined,
+) =>
+  declaration
+    ? {
+        settings,
+        employee: { ...employee, taxRegime: declaration.regime, declaredDeductions: declaration.deductions },
+        ytd: { ...ytd, gross: ytd.gross + declaration.previousGross, tds: ytd.tds + declaration.previousTds },
+      }
+    : { settings, employee, ytd };
+
+/** Work or off for each date that comes from a rotation or an override; default-shift dates are left out. */
+const rosterDaysFor = (days: Map<string, RosterEntry> | undefined) => {
+  const result = new Map<string, "work" | "off">();
+  for (const [date, entry] of days ?? []) {
+    if (entry.source !== "default") result.set(date, entry.shiftId ? "work" : "off");
+  }
+  return result;
 };

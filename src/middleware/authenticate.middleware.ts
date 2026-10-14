@@ -6,8 +6,13 @@ import { isActiveSession } from "@/services/session.services";
 import { sendResponse } from "@/utils/response";
 import { and, eq } from "drizzle-orm";
 import db from "@/utils/db";
-import { organizationsTable, userOrganizationsTable } from "@/drizzle/schema";
+import { organizationsTable, platformSubscriptionsTable, userOrganizationsTable } from "@/drizzle/schema";
+import { computeAccess, TRIAL_NOT_STARTED_MESSAGE } from "@/services/billing-access.services";
 import { readUuid } from "@/utils/request";
+
+// Reachable before the trial starts: billing (to start it) and the organization's own basics.
+const TRIAL_GATE_EXEMPT = ["/api/v1/billing/", "/api/v1/organization"];
+const ORGANIZATION_LIFECYCLE_PATH = /^\/api\/v1\/organization\/[0-9a-f-]{36}\/(deactivate|reactivate|deletion)$/i;
 
 const requestedOrganizationId = async (c: Context): Promise<string | null> => {
   const fromQuery = readUuid(c.req.query("organizationId"));
@@ -44,11 +49,21 @@ export const authenticate = async (c: Context, next: () => Promise<void>) => {
     const organizationId = await requestedOrganizationId(c);
     if (organizationId) {
       const [membership] = await db
-        .select({ status: organizationsTable.status })
+        .select({
+          status: organizationsTable.status,
+          isActive: organizationsTable.isActive,
+          trialEndsAt: organizationsTable.trialEndsAt,
+          paidUntil: platformSubscriptionsTable.paidUntil,
+          subscriptionStatus: platformSubscriptionsTable.status,
+        })
         .from(userOrganizationsTable)
         .innerJoin(
           organizationsTable,
           eq(organizationsTable.id, userOrganizationsTable.organizationId),
+        )
+        .leftJoin(
+          platformSubscriptionsTable,
+          eq(platformSubscriptionsTable.organizationId, organizationsTable.id),
         )
         .where(
           and(
@@ -58,14 +73,41 @@ export const authenticate = async (c: Context, next: () => Promise<void>) => {
           ),
         )
         .limit(1);
-      if (membership && membership.status !== "active") {
+      // The owner's pause, reactivate and deletion actions must work while the organization is locked.
+      if (membership && membership.status !== "active" && !ORGANIZATION_LIFECYCLE_PATH.test(c.req.path)) {
+        return membership.status === "pending_deletion"
+          ? sendResponse(
+              c,
+              "error",
+              "This organization is scheduled for deletion. The owner can cancel it from the organization menu.",
+              { code: "ORGANIZATION_PENDING_DELETION" },
+              403,
+            )
+          : sendResponse(
+              c,
+              "error",
+              "This organization is suspended. Contact support.",
+              { code: "ORGANIZATION_SUSPENDED" },
+              403,
+            );
+      }
+      // A paused organization is closed to everyone, including the owner, until they reactivate it.
+      if (membership && !membership.isActive && !ORGANIZATION_LIFECYCLE_PATH.test(c.req.path)) {
         return sendResponse(
           c,
           "error",
-          "This organization is suspended. Contact support.",
-          { code: "ORGANIZATION_SUSPENDED" },
+          "This organization is paused. The owner can reactivate it from the organization menu.",
+          { code: "ORGANIZATION_PAUSED" },
           403,
         );
+      }
+      // Until the owner starts the free trial, nothing in the workspace can be read or changed.
+      if (
+        membership &&
+        !TRIAL_GATE_EXEMPT.some((prefix) => c.req.path.startsWith(prefix)) &&
+        computeAccess(membership).state === "inactive"
+      ) {
+        return sendResponse(c, "error", TRIAL_NOT_STARTED_MESSAGE, { code: "TRIAL_NOT_STARTED" }, 402);
       }
     }
     await next();

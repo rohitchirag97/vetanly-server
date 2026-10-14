@@ -6,7 +6,7 @@ import type { z } from "zod";
 import db from "@/utils/db";
 import { employeeDocumentsTable } from "@/drizzle/schema";
 import { authorizeEmployeeRecord } from "@/services/access.services";
-import { deleteObject, isR2Configured, presignDownload, putPrivateObject } from "@/utils/r2";
+import { isFileStorageAvailable, removeFile, signedDownloadUrl, storeFile } from "@/utils/file-storage";
 import { fail, ok, type ServiceResult } from "@/utils/result";
 import {
   EMPLOYEE_UPLOAD_TYPES,
@@ -23,7 +23,8 @@ const SIGNATURES: { type: string; ext: string; bytes: number[] }[] = [
   { type: "image/png", ext: "png", bytes: [0x89, 0x50, 0x4e, 0x47] },
 ];
 
-const detectType = (data: Uint8Array) =>
+/** Identifies a PDF, JPG or PNG from its first bytes; the declared type and file name are not trusted. */
+export const detectType = (data: Uint8Array) =>
   SIGNATURES.find(({ bytes }) => bytes.every((byte, index) => data[index] === byte));
 
 const columns = {
@@ -81,7 +82,7 @@ export const uploadEmployeeDocument = async (
   if (!access.data.isManager && !EMPLOYEE_UPLOAD_TYPES.includes(fields.docType)) {
     return fail("forbidden", "Only an admin can upload this type of document");
   }
-  if (!isR2Configured()) return fail("invalid", "File storage is not configured");
+  if (!isFileStorageAvailable()) return fail("invalid", "File storage is not configured");
   if (file.size === 0) return fail("invalid", "The file is empty");
   if (file.size > MAX_DOCUMENT_BYTES) return fail("invalid", "The file must be 5 MB or smaller");
 
@@ -103,7 +104,7 @@ export const uploadEmployeeDocument = async (
   }
 
   const storageKey = `employee-documents/${organizationId}/${employeeId}/${randomUUID()}.${detected.ext}`;
-  await putPrivateObject(storageKey, data, detected.type);
+  await storeFile(storageKey, data, detected.type);
 
   try {
     const [document] = await db
@@ -121,7 +122,7 @@ export const uploadEmployeeDocument = async (
       .returning(columns);
     return ok(document);
   } catch (error) {
-    await deleteObject(storageKey).catch(() => undefined);
+    await removeFile(storageKey).catch(() => undefined);
     throw error;
   }
 };
@@ -150,8 +151,8 @@ export const getEmployeeDocumentUrl = async (
   if (!access.ok) return access;
   const document = await findDocument(organizationId, employeeId, documentId);
   if (!document) return fail("not-found", "Document not found");
-  if (!isR2Configured()) return fail("invalid", "File storage is not configured");
-  return ok({ url: presignDownload(document.storageKey), name: document.name });
+  if (!isFileStorageAvailable()) return fail("invalid", "File storage is not configured");
+  return ok({ url: signedDownloadUrl(document.storageKey), name: document.name });
 };
 
 export const deleteEmployeeDocument = async (
@@ -167,6 +168,6 @@ export const deleteEmployeeDocument = async (
   if (!access.data.isManager && document.uploadedBy !== requesterId) return fail("forbidden");
 
   await db.delete(employeeDocumentsTable).where(eq(employeeDocumentsTable.id, document.id));
-  if (isR2Configured()) await deleteObject(document.storageKey).catch(() => undefined);
+  if (isFileStorageAvailable()) await removeFile(document.storageKey).catch(() => undefined);
   return ok(null);
 };

@@ -35,6 +35,8 @@ const envSchema = z.object({
   RESEND_API_KEY: z.string().optional(),
   // A sender on a domain verified in Resend, e.g. "HazriPro <no-reply@yourdomain.com>".
   EMAIL_FROM: z.string().optional(),
+  // Public address of this API, for signed file links in local development. Defaults to http://localhost:PORT.
+  API_PUBLIC_URL: z.string().optional(),
   CORS_ORIGIN: z.string().optional(),
   GOOGLE_CLIENT_ID: z.string().optional(),
 });

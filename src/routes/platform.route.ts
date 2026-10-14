@@ -23,6 +23,7 @@ import {
   reactivatePlatformOrganizationController,
   suspendPlatformOrganizationController,
   savePlatformBillingProfileController,
+  savePlatformPlanOffersController,
   sendPlatformInvoiceWhatsAppController,
   setPlatformOrganizationPlanController,
   updatePlatformPlanController,
@@ -43,6 +44,7 @@ platformRoutes.get("/organizations/:organizationId", ...protect, getPlatformOrga
 platformRoutes.get("/organizations/:organizationId/billing", ...protect, getPlatformOrganizationBillingController);
 platformRoutes.put("/organizations/:organizationId/billing-profile", ...protect, savePlatformBillingProfileController);
 platformRoutes.put("/organizations/:organizationId/subscription", ...protect, setPlatformOrganizationPlanController);
+platformRoutes.put("/organizations/:organizationId/plan-offers", ...protect, savePlatformPlanOffersController);
 platformRoutes.post("/organizations/:organizationId/suspend", ...protect, suspendPlatformOrganizationController);
 platformRoutes.post("/organizations/:organizationId/reactivate", ...protect, reactivatePlatformOrganizationController);
 platformRoutes.post("/organizations/:organizationId/notes", ...protect, addPlatformNoteController);

@@ -2,7 +2,9 @@ export interface Organization {
   id: string;
   name: string;
   slug: string;
-  status?: "active" | "suspended" | "pending_deletion";
+  status?: "active" | "suspended" | "pending_deletion" | "deleted";
+  deactivatedAt?: Date | null;
+  deletionScheduledAt?: Date | null;
 }
 
 export interface UserOrganization {

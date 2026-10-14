@@ -12,6 +12,7 @@ import { ALL_ROLES, MANAGER_ROLES, requireRole } from "@/services/access.service
 import { enqueueLoanNocWhatsApp } from "@/queue/producer/sendSalarySlipWhatsApp";
 import { enqueueLoanNocEmail } from "@/queue/producer/sendDocumentEmail";
 import { deliveryChannels, type DeliveryChannels } from "@/services/user.services";
+import { requireFullAccess } from "@/services/billing-access.services";
 import { fail, ok, type ServiceResult } from "@/utils/result";
 
 export type LoanNoc = {
@@ -120,6 +121,8 @@ export const requestLoanNocWhatsApp = async (
 ): Promise<ServiceResult<null>> => {
   const loaded = await authorize(organizationId, requesterId, recoverableId);
   if (!loaded.ok) return loaded;
+  const billing = await requireFullAccess(organizationId);
+  if (!billing.ok) return billing;
   if (!loaded.data.delivery.whatsapp) {
     return fail("invalid", "This employee has no phone number linked for WhatsApp");
   }
@@ -134,6 +137,8 @@ export const requestLoanNocEmail = async (
 ): Promise<ServiceResult<null>> => {
   const loaded = await authorize(organizationId, requesterId, recoverableId);
   if (!loaded.ok) return loaded;
+  const billing = await requireFullAccess(organizationId);
+  if (!billing.ok) return billing;
   if (!loaded.data.delivery.email) {
     return fail("invalid", "This employee has no Google email linked");
   }

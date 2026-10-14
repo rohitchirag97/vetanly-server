@@ -147,6 +147,8 @@ export const getUsersOrganizations: (
       slug: organizationsTable.slug,
       isActive: organizationsTable.isActive,
       status: organizationsTable.status,
+      deactivatedAt: organizationsTable.deactivatedAt,
+      deletionScheduledAt: organizationsTable.deletionScheduledAt,
       role: userOrganizationsTable.role,
       membershipActive: userOrganizationsTable.isActive,
     })

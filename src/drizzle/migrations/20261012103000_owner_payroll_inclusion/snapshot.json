@@ -5274,7 +5274,7 @@
       "typeSchema": null,
       "notNull": true,
       "dimensions": 0,
-      "default": "'[]'::jsonb",
+      "default": "'[]'",
       "generated": null,
       "identity": null,
       "name": "features",

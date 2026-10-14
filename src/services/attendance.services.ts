@@ -6,7 +6,6 @@ import {
   attendanceLogsTable,
   leaveRequestsTable,
   organizationPayrollSettingsTable,
-  shiftsTable,
   userOrganizationsTable,
   UserRole,
   usersTable,
@@ -26,6 +25,7 @@ import { createLeaveRequest, updateLeaveStatus } from "@/services/leave.services
 import { holidayDatesBetween } from "@/services/holiday.services";
 import { parseWeeklyOff } from "@/services/payroll-settings.services";
 import { enqueueAttendance } from "@/queue/producer/recordAttendance";
+import { loadRoster } from "@/services/roster.services";
 import type { AttendanceJob } from "@/queue/types";
 import { fail, isUniqueViolation, ok, type ServiceResult } from "@/utils/result";
 import type {
@@ -317,16 +317,10 @@ export const recordBulkManualAttendance = async (
   const access = await requireRole(organizationId, requesterId, PEOPLE_MANAGER_ROLES);
   if (!access.ok) return access;
 
-  const [shiftRows, [settings]] = await Promise.all([
+  const [people, [settings]] = await Promise.all([
     db
-      .select({
-        employeeId: userOrganizationsTable.userId,
-        start: shiftsTable.startTime,
-        end: shiftsTable.endTime,
-        breakMinutes: shiftsTable.breakMinutes,
-      })
+      .select({ employeeId: userOrganizationsTable.userId, membershipId: userOrganizationsTable.id })
       .from(userOrganizationsTable)
-      .innerJoin(shiftsTable, eq(shiftsTable.id, userOrganizationsTable.shiftId))
       .where(eq(userOrganizationsTable.organizationId, organizationId)),
     db
       .select({ half: organizationPayrollSettingsTable.halfDayThresholdPercent })
@@ -334,7 +328,14 @@ export const recordBulkManualAttendance = async (
       .where(eq(organizationPayrollSettingsTable.organizationId, organizationId))
       .limit(1),
   ]);
-  const shiftByEmployee = new Map(shiftRows.map((row) => [row.employeeId, row]));
+  // Punch times come from the shift rostered on that date, not just the employee's default shift.
+  const roster = await loadRoster(organizationId, input.date, input.date, people.map((person) => person.membershipId));
+  const shiftByEmployee = new Map(
+    people.flatMap((person) => {
+      const shift = roster.byMembership.get(person.membershipId)?.get(input.date)?.shift;
+      return shift ? [[person.employeeId, { start: shift.startTime, end: shift.endTime, breakMinutes: shift.breakMinutes }] as const] : [];
+    }),
+  );
   const halfPercent = Number(settings?.half ?? 50);
 
   const toMinutes = (time: string) => {
@@ -381,7 +382,7 @@ export const recordBulkManualAttendance = async (
 
     const shift = shiftByEmployee.get(employeeId);
     if (!shift) {
-      report(false, "No shift assigned");
+      report(false, "No shift on this date (a rostered day off, or no shift assigned)");
       continue;
     }
     const start = toMinutes(shift.start.slice(0, 5));
@@ -432,11 +433,18 @@ export type DailyAttendance = {
 };
 
 const DAY_MINUTES = 1440;
+// How long after a night shift ends a check-out still belongs to that night.
+const NIGHT_CHECKOUT_GRACE_MINUTES = 240;
 
 const toMinutes = (time: string) => {
   const [hours, minutes] = time.split(":").map(Number);
   return hours * 60 + minutes;
 };
+
+const nextDate = (date: string) =>
+  new Date(Date.parse(`${date}T00:00:00Z`) + DAY_MINUTES * MINUTE_MS)
+    .toISOString()
+    .slice(0, 10);
 
 const previousDate = (date: string) =>
   new Date(Date.parse(`${date}T00:00:00Z`) - DAY_MINUTES * MINUTE_MS)
@@ -608,15 +616,12 @@ export const computeDailyAttendance = async (
     db
       .select({
         employeeId: userOrganizationsTable.userId,
+        membershipId: attendanceLogsTable.userOrganizationId,
         fname: usersTable.fname,
         lname: usersTable.lname,
         eventType: attendanceLogsTable.eventType,
         occurredAt: attendanceLogsTable.occurredAt,
         source: attendanceLogsTable.source,
-        shiftStart: shiftsTable.startTime,
-        shiftEnd: shiftsTable.endTime,
-        breakMinutes: shiftsTable.breakMinutes,
-        graceMinutes: shiftsTable.gracePeriodMinutes,
       })
       .from(attendanceLogsTable)
       .innerJoin(
@@ -624,7 +629,6 @@ export const computeDailyAttendance = async (
         eq(userOrganizationsTable.id, attendanceLogsTable.userOrganizationId),
       )
       .innerJoin(usersTable, eq(usersTable.id, userOrganizationsTable.userId))
-      .leftJoin(shiftsTable, eq(shiftsTable.id, userOrganizationsTable.shiftId))
       .where(and(...conditions))
       .orderBy(attendanceLogsTable.occurredAt),
     db
@@ -639,22 +643,43 @@ export const computeDailyAttendance = async (
   const fullPercent = Number(settings?.full ?? 90);
   const halfPercent = Number(settings?.half ?? 50);
 
+  // The shift for each employee and date comes from the roster (override, rotation, then default shift).
+  const roster = await loadRoster(
+    organizationId,
+    previousDate(query.from),
+    nextDate(query.to),
+    [...new Set(rows.map((row) => row.membershipId))],
+  );
+  const shiftOn = (membershipId: string, date: string) => {
+    const shift = roster.byMembership.get(membershipId)?.get(date)?.shift;
+    return {
+      shiftStart: shift?.startTime ?? null,
+      shiftEnd: shift?.endTime ?? null,
+      breakMinutes: shift?.breakMinutes ?? 0,
+      graceMinutes: shift?.gracePeriodMinutes ?? 0,
+    };
+  };
+
   const days = new Map<string, DailyAttendance>();
   const punches = new Map<string, { firstIn: Date | null; lastOut: Date | null; fixedIn: Date | null; fixedOut: Date | null }>();
-  const shifts = new Map<string, (typeof rows)[number]>();
+  const shifts = new Map<string, ReturnType<typeof shiftOn>>();
 
   for (const row of rows) {
     const local = new Date(row.occurredAt.getTime() + offsetMs);
     let date = local.toISOString().slice(0, 10);
+    // An early-morning punch belongs to the previous day when that day's shift ran past midnight.
+    const previousShift = shiftOn(row.membershipId, previousDate(date));
     if (
-      row.shiftStart &&
-      row.shiftEnd &&
-      toMinutes(row.shiftEnd) < toMinutes(row.shiftStart)
+      previousShift.shiftStart &&
+      previousShift.shiftEnd &&
+      toMinutes(previousShift.shiftEnd) < toMinutes(previousShift.shiftStart)
     ) {
       const minuteOfDay = Math.floor(
         ((row.occurredAt.getTime() + offsetMs) % (DAY_MINUTES * MINUTE_MS)) / MINUTE_MS,
       );
-      if (minuteOfDay <= toMinutes(row.shiftEnd)) date = previousDate(date);
+      // A check-out may run past the shift end (overtime, a late handover); a check-in may not.
+      const window = row.eventType === "check_out" ? NIGHT_CHECKOUT_GRACE_MINUTES : 0;
+      if (minuteOfDay <= toMinutes(previousShift.shiftEnd) + window) date = previousDate(date);
     }
     const key = `${row.employeeId}|${date}`;
     if (!days.has(key)) {
@@ -671,7 +696,7 @@ export const computeDailyAttendance = async (
         status: "incomplete",
       });
       punches.set(key, { firstIn: null, lastOut: null, fixedIn: null, fixedOut: null });
-      shifts.set(key, row);
+      shifts.set(key, shiftOn(row.membershipId, date));
     }
     const punch = punches.get(key)!;
     // An approved correction replaces the original punch of that type for the day.

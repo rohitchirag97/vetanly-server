@@ -1,17 +1,27 @@
 import { z } from "zod";
 
-export const platformPlanSchema = z.object({
+const planFields = {
   name: z.string().trim().min(1).max(100),
-  description: z.string().trim().max(500).optional().default(""),
+  description: z.string().trim().max(500),
   priceAmount: z.coerce.number().finite().min(0).max(1_000_000_000).multipleOf(0.01),
   billingPeriod: z.enum(["monthly", "annual"]),
   includedEmployees: z.coerce.number().int().min(0).max(1_000_000),
   overagePrice: z.coerce.number().finite().min(0).max(1_000_000_000).multipleOf(0.01),
-  features: z.array(z.string().trim().min(1).max(60)).max(30).default([]),
-  isActive: z.boolean().default(true),
+  features: z.array(z.string().trim().min(1).max(60)).max(30),
+  visibility: z.enum(["public", "custom"]),
+  isActive: z.boolean(),
+};
+
+export const platformPlanSchema = z.object({
+  ...planFields,
+  description: planFields.description.optional().default(""),
+  features: planFields.features.default([]),
+  visibility: planFields.visibility.default("public"),
+  isActive: planFields.isActive.default(true),
 });
 
-export const platformPlanUpdateSchema = platformPlanSchema.partial().refine((data) => Object.keys(data).length > 0, {
+// No defaults here: a field left out of an update must stay as it is, not reset.
+export const platformPlanUpdateSchema = z.object(planFields).partial().refine((data) => Object.keys(data).length > 0, {
   message: "Provide at least one plan field to update.",
 });
 
@@ -20,6 +30,8 @@ export const platformSubscriptionSchema = z.object({
   status: z.enum(["active", "trial", "past_due", "cancelled"]).default("active"),
   startsAt: z.iso.date().optional(),
   nextBillingAt: z.iso.date().optional().or(z.literal("")),
+  // Last paid day, inclusive. Setting it activates full access and closes any upgrade request.
+  paidUntil: z.iso.date().optional().or(z.literal("")),
 });
 
 export const platformBillingProfileSchema = z.object({
@@ -74,4 +86,9 @@ export const platformInvoicePaidSchema = z.object({
 
 export const platformInvoiceVoidSchema = z.object({
   reason: z.string().trim().min(3).max(500),
+});
+
+// Replaces the full set of custom plans offered to one organization.
+export const platformPlanOffersSchema = z.object({
+  planIds: z.array(z.uuid()).max(50),
 });

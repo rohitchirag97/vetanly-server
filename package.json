@@ -2,6 +2,7 @@
   "name": "server",
   "scripts": {
     "dev": "bun run --watch src/index.ts",
+    "test": "bun test",
     "start": "bun run src/index.ts",
     "db:push": "drizzle-kit push",
     "db:generate": "drizzle-kit generate",

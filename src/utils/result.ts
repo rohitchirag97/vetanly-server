@@ -2,7 +2,7 @@ import type { Context } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { sendResponse } from "@/utils/response";
 
-export type ServiceError = "forbidden" | "not-found" | "conflict" | "invalid";
+export type ServiceError = "forbidden" | "not-found" | "conflict" | "invalid" | "payment-required";
 
 export type ServiceFailure = {
   ok: false;
@@ -25,6 +25,7 @@ const statusByError: Record<ServiceError, ContentfulStatusCode> = {
   "not-found": 404,
   conflict: 409,
   invalid: 400,
+  "payment-required": 402,
 };
 
 const defaultMessages: Record<ServiceError, string> = {
@@ -32,6 +33,7 @@ const defaultMessages: Record<ServiceError, string> = {
   "not-found": "Not found",
   conflict: "Conflict",
   invalid: "Invalid request",
+  "payment-required": "Your organization's plan has expired",
 };
 
 export const respond = <T>(

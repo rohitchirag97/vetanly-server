@@ -27,6 +27,13 @@ export const ensureAuditLogGuards = async () => {
   await db.execute(sql`
     CREATE OR REPLACE FUNCTION audit_logs_block_change() RETURNS trigger AS $$
     BEGIN
+      -- The only exception: the scheduled-deletion purge erases one organization's whole log
+      -- (its hash chain is per organization) inside a transaction that names it. Edits stay blocked.
+      IF TG_OP = 'DELETE' THEN
+        IF OLD.organization_id::text = current_setting('hazripro.purge_organization_id', true) THEN
+          RETURN OLD;
+        END IF;
+      END IF;
       RAISE EXCEPTION 'audit_logs is append-only: % is not allowed', TG_OP USING ERRCODE = '42501';
     END;
     $$ LANGUAGE plpgsql`);

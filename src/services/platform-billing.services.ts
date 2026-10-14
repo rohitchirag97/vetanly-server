@@ -1,10 +1,11 @@
-import { and, desc, eq, ilike, or, sql } from "drizzle-orm";
+import { and, desc, eq, ilike, inArray, or, sql } from "drizzle-orm";
 
 import {
   organizationsTable,
   platformBillingProfilesTable,
   platformInvoiceItemsTable,
   platformInvoicesTable,
+  platformPlanOffersTable,
   platformPlansTable,
   platformSubscriptionsTable,
   userOrganizationsTable,
@@ -13,6 +14,7 @@ import {
 import type { PlatformActor } from "@/services/platform.services";
 import { recordPlatformEvent } from "@/services/platform.services";
 import db from "@/utils/db";
+import { computeAccess, countBillableEmployees, getOrganizationAccess } from "@/services/billing-access.services";
 
 type PlanInput = {
   name: string;
@@ -22,6 +24,7 @@ type PlanInput = {
   includedEmployees: number;
   overagePrice: number;
   features: string[];
+  visibility: "public" | "custom";
   isActive: boolean;
 };
 
@@ -73,6 +76,7 @@ export const updatePlatformPlan = async (actor: PlatformActor, planId: string, p
   if (patch.includedEmployees !== undefined) values.includedEmployees = patch.includedEmployees;
   if (patch.overagePrice !== undefined) values.overagePrice = patch.overagePrice.toFixed(2);
   if (patch.features !== undefined) values.features = patch.features;
+  if (patch.visibility !== undefined) values.visibility = patch.visibility;
   if (patch.isActive !== undefined) values.isActive = patch.isActive;
   const [plan] = await db.update(platformPlansTable).set(values).where(eq(platformPlansTable.id, planId)).returning();
   if (!plan) return null;
@@ -88,6 +92,7 @@ export const getPlatformOrganizationBilling = async (actor: PlatformActor, organ
     status: platformSubscriptionsTable.status,
     startsAt: platformSubscriptionsTable.startsAt,
     nextBillingAt: platformSubscriptionsTable.nextBillingAt,
+    paidUntil: platformSubscriptionsTable.paidUntil,
     planId: platformPlansTable.id,
     planName: platformPlansTable.name,
     priceAmount: platformPlansTable.priceAmount,
@@ -96,8 +101,54 @@ export const getPlatformOrganizationBilling = async (actor: PlatformActor, organ
   }).from(platformSubscriptionsTable)
     .innerJoin(platformPlansTable, eq(platformPlansTable.id, platformSubscriptionsTable.planId))
     .where(eq(platformSubscriptionsTable.organizationId, organizationId)).limit(1);
+  const [[organization], access, billableEmployees, offers] = await Promise.all([
+    db.select({ upgradeRequestedAt: organizationsTable.upgradeRequestedAt }).from(organizationsTable)
+      .where(eq(organizationsTable.id, organizationId)).limit(1),
+    getOrganizationAccess(organizationId),
+    countBillableEmployees(organizationId),
+    db.select({ planId: platformPlanOffersTable.planId }).from(platformPlanOffersTable)
+      .where(eq(platformPlanOffersTable.organizationId, organizationId)),
+  ]);
   await recordPlatformEvent({ actor, action: "billing.organization.read", organizationId });
-  return { profile: profile ?? null, subscription: subscription ?? null };
+  return {
+    profile: profile ?? null,
+    subscription: subscription ?? null,
+    access,
+    billableEmployees,
+    upgradeRequestedAt: organization?.upgradeRequestedAt ?? null,
+    offeredPlanIds: offers.map((offer) => offer.planId),
+  };
+};
+
+/** Replaces the custom plans this organization's owner can see. Public plans need no offer. */
+export const savePlatformPlanOffers = async (actor: PlatformActor, organizationId: string, planIds: string[]) => {
+  const uniqueIds = [...new Set(planIds)];
+  const [[organization], plans] = await Promise.all([
+    db.select({ id: organizationsTable.id, name: organizationsTable.name }).from(organizationsTable)
+      .where(eq(organizationsTable.id, organizationId)).limit(1),
+    uniqueIds.length
+      ? db.select({ id: platformPlansTable.id, visibility: platformPlansTable.visibility }).from(platformPlansTable)
+        .where(inArray(platformPlansTable.id, uniqueIds))
+      : [],
+  ]);
+  if (!organization) return { status: "organization-missing" as const };
+  if (plans.length !== uniqueIds.length || plans.some((plan) => plan.visibility !== "custom")) {
+    return { status: "invalid-plans" as const };
+  }
+  await db.transaction(async (tx) => {
+    await tx.delete(platformPlanOffersTable).where(eq(platformPlanOffersTable.organizationId, organizationId));
+    if (uniqueIds.length) {
+      await tx.insert(platformPlanOffersTable).values(uniqueIds.map((planId) => ({ planId, organizationId })));
+    }
+  });
+  await recordPlatformEvent({
+    actor,
+    action: "billing.plan_offers.save",
+    organizationId,
+    organizationName: organization.name,
+    afterValues: { planIds: uniqueIds },
+  });
+  return { status: "saved" as const, offeredPlanIds: uniqueIds };
 };
 
 export const savePlatformBillingProfile = async (
@@ -150,7 +201,13 @@ export const savePlatformBillingProfile = async (
 export const setPlatformOrganizationPlan = async (
   actor: PlatformActor,
   organizationId: string,
-  input: { planId: string; status: "active" | "trial" | "past_due" | "cancelled"; startsAt?: string; nextBillingAt?: string },
+  input: {
+    planId: string;
+    status: "active" | "trial" | "past_due" | "cancelled";
+    startsAt?: string;
+    nextBillingAt?: string;
+    paidUntil?: string;
+  },
 ) => {
   const [[organization], [plan]] = await Promise.all([
     db.select({ id: organizationsTable.id, name: organizationsTable.name }).from(organizationsTable)
@@ -160,29 +217,30 @@ export const setPlatformOrganizationPlan = async (
   ]);
   if (!organization) return { status: "organization-missing" as const };
   if (!plan || !plan.isActive) return { status: "plan-unavailable" as const };
-  const [subscription] = await db.insert(platformSubscriptionsTable).values({
-    organizationId,
+  const values = {
     planId: input.planId,
     status: input.status,
     startsAt: input.startsAt || new Date().toISOString().slice(0, 10),
     nextBillingAt: input.nextBillingAt || null,
+    paidUntil: input.paidUntil || null,
     updatedAt: new Date(),
-  }).onConflictDoUpdate({
-    target: platformSubscriptionsTable.organizationId,
-    set: {
-      planId: input.planId,
-      status: input.status,
-      startsAt: input.startsAt || new Date().toISOString().slice(0, 10),
-      nextBillingAt: input.nextBillingAt || null,
-      updatedAt: new Date(),
-    },
-  }).returning();
+  };
+  const subscription = await db.transaction(async (tx) => {
+    const [saved] = await tx.insert(platformSubscriptionsTable).values({ organizationId, ...values })
+      .onConflictDoUpdate({ target: platformSubscriptionsTable.organizationId, set: values })
+      .returning();
+    // A recorded paid period answers the owner's upgrade request.
+    if (values.paidUntil) {
+      await tx.update(organizationsTable).set({ upgradeRequestedAt: null }).where(eq(organizationsTable.id, organizationId));
+    }
+    return saved;
+  });
   await recordPlatformEvent({
     actor,
     action: "billing.subscription.assign",
     organizationId,
     organizationName: organization.name,
-    afterValues: { planId: plan.id, planName: plan.name, status: subscription.status },
+    afterValues: { planId: plan.id, planName: plan.name, status: subscription.status, paidUntil: subscription.paidUntil },
   });
   return { status: "saved" as const, subscription };
 };
@@ -423,5 +481,36 @@ export const getPlatformBillingOverview = async () => {
     activeSubscriptions: Number(subscriptions?.count ?? 0),
     openInvoices: Number(invoices?.count ?? 0),
     outstandingAmount: invoices?.outstanding ?? "0.00",
+    attention: await listBillingAttention(),
   };
+};
+
+/**
+ * Organizations that need the platform owner: an open upgrade request, a trial or paid period
+ * ending within 7 days, a grace period, or read-only access. Upgrade requests come first.
+ */
+const listBillingAttention = async () => {
+  const rows = await db.select({
+    id: organizationsTable.id,
+    name: organizationsTable.name,
+    trialEndsAt: organizationsTable.trialEndsAt,
+    upgradeRequestedAt: organizationsTable.upgradeRequestedAt,
+    paidUntil: platformSubscriptionsTable.paidUntil,
+    subscriptionStatus: platformSubscriptionsTable.status,
+  }).from(organizationsTable)
+    .leftJoin(platformSubscriptionsTable, eq(platformSubscriptionsTable.organizationId, organizationsTable.id))
+    .where(eq(organizationsTable.status, "active"));
+  return rows
+    .map((row) => ({
+      id: row.id,
+      name: row.name,
+      upgradeRequestedAt: row.upgradeRequestedAt,
+      access: computeAccess(row),
+    }))
+    .filter(({ upgradeRequestedAt, access }) =>
+      upgradeRequestedAt !== null || access.state === "grace" || access.state === "read_only" || access.daysLeft <= 7)
+    .sort((a, b) =>
+      Number(b.upgradeRequestedAt !== null) - Number(a.upgradeRequestedAt !== null)
+      || (a.access.accessEndsAt ?? "9999").localeCompare(b.access.accessEndsAt ?? "9999"))
+    .slice(0, 50);
 };

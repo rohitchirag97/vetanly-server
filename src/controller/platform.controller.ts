@@ -14,7 +14,7 @@ import {
   type PlatformActor,
 } from "@/services/platform.services";
 import { compareHash, hash } from "@/utils/hash";
-import { del, get, incrementWithExpiry, set } from "@/utils/redis";
+import { del, get, incrementWithExpiry, secondsLeft, set, setIfAbsent } from "@/utils/redis";
 import { sendOtp } from "@/queue/producer/sendOtp";
 import { enqueuePlatformInvoiceWhatsApp } from "@/queue/producer/sendSalarySlipWhatsApp";
 import {
@@ -29,6 +29,7 @@ import {
   markPlatformInvoicePaid,
   savePlatformBillingProfile,
   setPlatformInvoiceWhatsAppStatus,
+  savePlatformPlanOffers,
   setPlatformOrganizationPlan,
   updatePlatformPlan,
   voidPlatformInvoice,
@@ -52,6 +53,7 @@ import {
   platformInvoiceVoidSchema,
   platformPlanSchema,
   platformPlanUpdateSchema,
+  platformPlanOffersSchema,
   platformSubscriptionSchema,
 } from "@/validator/platform-billing.validator";
 
@@ -83,10 +85,24 @@ export const getPlatformMeController = async (c: Context): Promise<Response> => 
   });
 };
 
+const PLATFORM_OTP_RESEND_SECONDS = 60;
+
 export const platformReauthSendController = async (c: Context): Promise<Response> => {
   const user = c.get("user") as AuthenticatedUser;
   const sessionId = c.get("sessionId") as string | undefined;
   if (!sessionId) return sendResponse(c, "error", "Your session has expired.", null, 401);
+  // One code per minute per session: a page refresh or a repeated request reuses the code just sent
+  // instead of replacing it, and does not count against the hourly limit.
+  const cooldownKey = `platform-otp-cooldown:${sessionId}`;
+  if (!(await setIfAbsent(cooldownKey, "1", PLATFORM_OTP_RESEND_SECONDS))) {
+    return sendResponse(
+      c,
+      "success",
+      "A verification code was sent to your account phone moments ago. Use that code.",
+      { resendInSeconds: await secondsLeft(cooldownKey), alreadySent: true },
+      200,
+    );
+  }
   const sent = await incrementWithExpiry(`platform-otp-send:${user.id}`, 3600);
   if (sent > 5) {
     return sendResponse(c, "error", "Too many verification codes requested. Try again later.", null, 429);
@@ -96,7 +112,13 @@ export const platformReauthSendController = async (c: Context): Promise<Response
   await del(`platform-otp-attempts:${sessionId}`);
   await sendOtp(user.phone, otp);
   await recordPlatformEvent({ actor: getActor(c), action: "platform.reauth.otp_sent" });
-  return sendResponse(c, "success", "Verification code sent to your account phone.", null, 200);
+  return sendResponse(
+    c,
+    "success",
+    "Verification code sent to your account phone.",
+    { resendInSeconds: PLATFORM_OTP_RESEND_SECONDS, alreadySent: false },
+    200,
+  );
 };
 
 export const platformReauthVerifyController = async (c: Context): Promise<Response> => {
@@ -332,4 +354,13 @@ export const sendPlatformInvoiceWhatsAppController = async (c: Context): Promise
     throw error;
   }
   return sendResponse(c, "success", "Invoice queued for WhatsApp delivery", { status: "queued", destination: `${destination.slice(0, 3)}***${destination.slice(-2)}` }, 202);
+};
+
+export const savePlatformPlanOffersController = async (c: Context): Promise<Response> => {
+  const parsed = platformPlanOffersSchema.safeParse(await readBody(c));
+  if (!parsed.success) return sendResponse(c, "error", parsed.error.issues[0]?.message ?? "Invalid plan offers", null, 400);
+  const result = await savePlatformPlanOffers(getActor(c), c.req.param("organizationId")!, parsed.data.planIds);
+  if (result.status === "organization-missing") return sendResponse(c, "error", "Organization not found", null, 404);
+  if (result.status === "invalid-plans") return sendResponse(c, "error", "Only existing custom plans can be offered.", null, 400);
+  return sendResponse(c, "success", "Custom plan offers saved", { offeredPlanIds: result.offeredPlanIds });
 };
