@@ -2,6 +2,7 @@ export interface Organization {
   id: string;
   name: string;
   slug: string;
+  status?: "active" | "suspended" | "pending_deletion";
 }
 
 export interface UserOrganization {

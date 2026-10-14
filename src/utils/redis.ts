@@ -1,8 +1,9 @@
 import Redis from "ioredis";
-import { env } from "./env";
+import { redisConnection } from "./env";
 
 const withRedis = async <T>(operation: (client: Redis) => Promise<T>) => {
-  const client = new Redis(env.REDIS_URL, {
+  const client = new Redis({
+    ...redisConnection,
     lazyConnect: true,
     connectTimeout: 5000,
     maxRetriesPerRequest: 1,
@@ -40,3 +41,11 @@ export const get = async (key: string) => {
 export const del = async (key: string) => {
   return withRedis((client) => client.del(key));
 };
+
+// Atomically increments a counter, starting the expiry window on first use.
+export const incrementWithExpiry = async (key: string, windowSeconds: number) =>
+  withRedis(async (client) => {
+    const count = await client.incr(key);
+    if (count === 1) await client.expire(key, windowSeconds);
+    return count;
+  });

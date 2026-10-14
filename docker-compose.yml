@@ -1,27 +1,36 @@
+# Credentials and ports come from .env next to this file (see .env.example).
+# The app reads the same POSTGRES_* and REDIS_* variables, so both sides always agree.
 services:
   database:
     image: postgres:17-alpine
     container_name: hazripro-database
     environment:
-      POSTGRES_USER: hazripro
-      POSTGRES_PASSWORD: hazripro
-      POSTGRES_DB: hazripro
+      POSTGRES_USER: "${POSTGRES_USER:?Set POSTGRES_USER in .env}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}"
+      POSTGRES_DB: "${POSTGRES_DB:?Set POSTGRES_DB in .env}"
     ports:
-      - "5432:5432"
+      - "127.0.0.1:${POSTGRES_PORT:?Set POSTGRES_PORT in .env}:5432"
     volumes:
-      - ./data:/var/lib/postgresql/data
+      - database_data:/var/lib/postgresql/data
     networks:
       - hazri_network
 
   redis:
     image: redis:7-alpine
     container_name: hazripro-redis
+    environment:
+      REDIS_PASSWORD: "${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}"
+    command: ["sh", "-c", "exec redis-server --requirepass \"$$REDIS_PASSWORD\""]
     ports:
-      - "6379:6379"
+      - "127.0.0.1:${REDIS_PORT:?Set REDIS_PORT in .env}:6379"
     volumes:
-      - ./redis-data:/data
+      - redis_data:/data
     networks:
       - hazri_network
 
 networks:
   hazri_network:
+
+volumes:
+  database_data:
+  redis_data:

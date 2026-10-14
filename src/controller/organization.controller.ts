@@ -5,9 +5,13 @@ import {
   getOrganizationBySlug,
   getOrganizationwithUser,
   getUsersOrganizations,
+  updateOrganization as updateOrganizationService,
 } from "@/services/organizations.services";
 import { sendResponse } from "@/utils/response";
-import { createOrganizationSchema } from "@/validator/organization.validator";
+import {
+  createOrganizationSchema,
+  updateOrganizationSchema,
+} from "@/validator/organization.validator";
 
 export const createOrganization: (c: Context) => Promise<any> = async (
   c: Context,
@@ -51,6 +55,52 @@ export const getUsersOrganizationsController: (
     "Organizations fetched successfully",
     organizations,
     200,
+  );
+};
+
+export const updateOrganizationController = async (c: Context): Promise<Response> => {
+  const user = c.get("user");
+  if (!user) {
+    return sendResponse(c, "error", "Unauthorized", null, 401);
+  }
+
+  const organizationId = c.req.param("organizationId");
+  if (!organizationId) {
+    return sendResponse(c, "error", "Organization ID is required", null, 400);
+  }
+
+  const body: unknown = await c.req.json().catch(() => null);
+  const parsed = updateOrganizationSchema.safeParse(body);
+  if (!parsed.success) {
+    return sendResponse(
+      c,
+      "error",
+      parsed.error.issues[0]?.message ?? "Invalid organization details",
+      null,
+      400,
+    );
+  }
+
+  const result = await updateOrganizationService(
+    organizationId,
+    user.id,
+    parsed.data,
+  );
+  if (result.status === "organization-not-found") {
+    return sendResponse(c, "error", "Organization not found", null, 404);
+  }
+  if (result.status === "forbidden") {
+    return sendResponse(c, "error", "Only the organization super admin can update it", null, 403);
+  }
+  if (result.status === "slug-taken") {
+    return sendResponse(c, "error", "Organization slug is already in use", null, 409);
+  }
+
+  return sendResponse(
+    c,
+    "success",
+    "Organization updated successfully",
+    result.organization,
   );
 };
 

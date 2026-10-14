@@ -1,8 +1,11 @@
 import type { Worker } from "bullmq";
+import { createAttendanceWorker } from "./attendanceWorker";
 import { createOtpWorker } from "./otpWorker";
+import { createWhatsAppWorker } from "./whatsappWorker";
+import { createEmailWorker } from "./emailWorker";
 
 // Register each service worker here as the background services grow.
-const workers: Worker[] = [createOtpWorker()];
+const workers: Worker[] = [createOtpWorker(), createAttendanceWorker(), createWhatsAppWorker(), createEmailWorker()];
 
 for (const worker of workers) {
   worker.on("error", (error) => {

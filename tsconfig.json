@@ -3,7 +3,7 @@
     "strict": true,
     "types": ["bun"],
     "jsx": "react-jsx",
-    "jsxImportSource": "hono/jsx",
+    "jsxImportSource": "react",
     "paths": {
       "@/*": ["./src/*"]
     }

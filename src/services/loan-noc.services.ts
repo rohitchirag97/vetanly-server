@@ -1,0 +1,142 @@
+import { and, desc, eq } from "drizzle-orm";
+
+import db from "@/utils/db";
+import {
+  employeeRecoverableRepaymentsTable as repayments,
+  employeeRecoverablesTable as recoverables,
+  organizationsTable,
+  userOrganizationsTable,
+  usersTable,
+} from "@/drizzle/schema";
+import { ALL_ROLES, MANAGER_ROLES, requireRole } from "@/services/access.services";
+import { enqueueLoanNocWhatsApp } from "@/queue/producer/sendSalarySlipWhatsApp";
+import { enqueueLoanNocEmail } from "@/queue/producer/sendDocumentEmail";
+import { deliveryChannels, type DeliveryChannels } from "@/services/user.services";
+import { fail, ok, type ServiceResult } from "@/utils/result";
+
+export type LoanNoc = {
+  reference: string;
+  organizationName: string;
+  employeeName: string;
+  type: "loan" | "salary_advance";
+  principalAmount: string;
+  currencyCode: string;
+  disbursedAt: string | null;
+  closedAt: string;
+  issuedAt: string;
+};
+
+/** NOC data and recipient. No access check; callers authorize first. */
+export const loadLoanNoc = async (
+  organizationId: string,
+  recoverableId: string,
+): Promise<ServiceResult<{ noc: LoanNoc; phone: string; email: string | null; delivery: DeliveryChannels; employeeId: string }>> => {
+  const [row] = await db
+    .select({
+      id: recoverables.id,
+      type: recoverables.type,
+      status: recoverables.status,
+      principalAmount: recoverables.principalAmount,
+      currencyCode: recoverables.currencyCode,
+      disbursedAt: recoverables.disbursedAt,
+      fname: usersTable.fname,
+      lname: usersTable.lname,
+      phone: usersTable.phone,
+      email: usersTable.email,
+      emailVerified: usersTable.emailVerified,
+      employeeId: usersTable.id,
+      organizationName: organizationsTable.name,
+    })
+    .from(recoverables)
+    .innerJoin(
+      userOrganizationsTable,
+      eq(userOrganizationsTable.id, recoverables.userOrganizationId),
+    )
+    .innerJoin(usersTable, eq(usersTable.id, userOrganizationsTable.userId))
+    .innerJoin(organizationsTable, eq(organizationsTable.id, recoverables.organizationId))
+    .where(and(eq(recoverables.organizationId, organizationId), eq(recoverables.id, recoverableId)))
+    .limit(1);
+  if (!row) return fail("not-found", "Record not found");
+  if (row.status !== "completed") {
+    return fail("conflict", "A NOC can only be issued once the loan is fully repaid and closed");
+  }
+
+  const [lastPayment] = await db
+    .select({ paidAt: repayments.paidAt })
+    .from(repayments)
+    .where(
+      and(
+        eq(repayments.organizationId, organizationId),
+        eq(repayments.recoverableId, recoverableId),
+        eq(repayments.status, "confirmed"),
+      ),
+    )
+    .orderBy(desc(repayments.paidAt))
+    .limit(1);
+
+  return ok({
+    phone: row.phone,
+    email: row.email && row.emailVerified ? row.email : null,
+    delivery: deliveryChannels(row),
+    employeeId: row.employeeId,
+    noc: {
+      reference: `NOC-${row.id.slice(0, 8).toUpperCase()}`,
+      organizationName: row.organizationName,
+      employeeName: `${row.fname} ${row.lname}`.trim(),
+      type: row.type,
+      principalAmount: row.principalAmount,
+      currencyCode: row.currencyCode,
+      disbursedAt: row.disbursedAt ? row.disbursedAt.toISOString() : null,
+      closedAt: (lastPayment?.paidAt ?? new Date()).toISOString(),
+      issuedAt: new Date().toISOString(),
+    },
+  });
+};
+
+const authorize = async (organizationId: string, requesterId: string, recoverableId: string) => {
+  const access = await requireRole(organizationId, requesterId, ALL_ROLES);
+  if (!access.ok) return access;
+  const loaded = await loadLoanNoc(organizationId, recoverableId);
+  if (!loaded.ok) return loaded;
+  if (!MANAGER_ROLES.includes(access.data.role) && loaded.data.employeeId !== requesterId) {
+    return fail("not-found", "Record not found");
+  }
+  return loaded;
+};
+
+export const getLoanNoc = async (
+  organizationId: string,
+  requesterId: string,
+  recoverableId: string,
+): Promise<ServiceResult<LoanNoc & { delivery: DeliveryChannels }>> => {
+  const loaded = await authorize(organizationId, requesterId, recoverableId);
+  return loaded.ok ? ok({ ...loaded.data.noc, delivery: loaded.data.delivery }) : loaded;
+};
+
+export const requestLoanNocWhatsApp = async (
+  organizationId: string,
+  requesterId: string,
+  recoverableId: string,
+): Promise<ServiceResult<null>> => {
+  const loaded = await authorize(organizationId, requesterId, recoverableId);
+  if (!loaded.ok) return loaded;
+  if (!loaded.data.delivery.whatsapp) {
+    return fail("invalid", "This employee has no phone number linked for WhatsApp");
+  }
+  await enqueueLoanNocWhatsApp({ organizationId, recoverableId, requestedByUserId: requesterId });
+  return ok(null);
+};
+
+export const requestLoanNocEmail = async (
+  organizationId: string,
+  requesterId: string,
+  recoverableId: string,
+): Promise<ServiceResult<null>> => {
+  const loaded = await authorize(organizationId, requesterId, recoverableId);
+  if (!loaded.ok) return loaded;
+  if (!loaded.data.delivery.email) {
+    return fail("invalid", "This employee has no Google email linked");
+  }
+  await enqueueLoanNocEmail({ organizationId, recoverableId, requestedByUserId: requesterId });
+  return ok(null);
+};

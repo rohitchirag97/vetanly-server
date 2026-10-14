@@ -1,10 +1,11 @@
-import { env } from "@/utils/env";
+import { redisConnection } from "@/utils/env";
 
 export const queueNames = {
   otp: "otpQueue",
+  attendance: "attendanceQueue",
+  whatsapp: "whatsappQueue",
+  email: "emailQueue",
 } as const;
 
 /** Return connection options per BullMQ instance. */
-export const getQueueConnection = () => ({
-  url: env.REDIS_URL,
-});
+export const getQueueConnection = () => ({ ...redisConnection });
