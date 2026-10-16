@@ -5,13 +5,18 @@ COPY package.json bun.lock ./
 RUN bun install --frozen-lockfile --production
 
 # --- Migrations: adds drizzle-kit. Used by `docker compose run --rm migrate` ---
-FROM oven/bun:1.3.5-alpine AS migrate
+FROM oven/bun:1.3.5-alpine AS migrate-deps
 WORKDIR /app
 COPY package.json bun.lock ./
 RUN bun install --frozen-lockfile
-COPY drizzle.config.ts tsconfig.json ./
+
+# drizzle-kit runs on Node: it loads node:sqlite, which Bun does not provide.
+FROM node:24-alpine AS migrate
+WORKDIR /app
+COPY --from=migrate-deps /app/node_modules ./node_modules
+COPY package.json drizzle.config.ts tsconfig.json ./
 COPY src ./src
-CMD ["bun", "run", "db:migrate"]
+CMD ["node_modules/.bin/drizzle-kit", "migrate"]
 
 # --- Runtime (default target): the API and its background queue workers in one process ---
 FROM oven/bun:1.3.5-alpine AS runtime
