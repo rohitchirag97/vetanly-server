@@ -30,6 +30,8 @@ const envSchema = z.object({
   VETANLY_WHATSAPP_URL: z.string().url().optional().or(z.literal("")),
   VETANLY_WHATSAPP_API_KEY: z.string().optional(),
   VETANLY_WHATSAPP_WEBHOOK_SECRET: z.string().optional(),
+  // apitxt SMS login codes, used until Vetanly WhatsApp is configured. Unset: no SMS.
+  SMS_API_AUTH_KEY: z.string().optional(),
   PLATFORM_BILLING_NAME: z.string().optional(),
   PLATFORM_BILLING_ADDRESS: z.string().optional(),
   PLATFORM_BILLING_GSTIN: z.string().optional(),

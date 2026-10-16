@@ -1,10 +1,12 @@
 import { Worker } from "bullmq";
 import { getQueueConnection, queueNames } from "@/queue/config";
+import { isSmsOtpConfigured, sendSmsOtp } from "@/services/sms-otp";
 import { VETANLY_TEMPLATES, isVetanlyWhatsAppConfigured, sendVetanlyWhatsApp } from "@/services/vetanly-whatsapp";
 
 /**
  * Login codes always go out from Vetanly's own WhatsApp service, never an organization's provider,
- * so every user sees the same trusted sender. Without the service, development prints the code.
+ * so every user sees the same trusted sender. Until that service is set up they go by SMS (apitxt);
+ * with neither, development prints the code.
  */
 export function createOtpWorker() {
   return new Worker(
@@ -29,8 +31,12 @@ export function createOtpWorker() {
         });
         return;
       }
+      if (isSmsOtpConfigured()) {
+        await sendSmsOtp(phone, otp);
+        return;
+      }
       if (process.env.NODE_ENV === "production") {
-        throw new Error("Vetanly WhatsApp is not configured, so login codes cannot be sent");
+        throw new Error("Neither Vetanly WhatsApp nor SMS_API_AUTH_KEY is configured, so login codes cannot be sent");
       }
       // Development-only output. Do not log OTPs or phone numbers in production.
       console.log(`Development OTP for ${phone}: ${otp}`);
