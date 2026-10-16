@@ -12,6 +12,8 @@ export const createHolidaySchema = z
     name: z.string().trim().min(1, "Name is required").max(100),
     date: isoDate,
     endDate: isoDate.optional(),
+    // Only this branch has the day off; leave out for every branch.
+    branchId: z.uuid().optional(),
   })
   .refine((value) => !value.endDate || value.endDate >= value.date, {
     message: "End date must not be before the start date",
@@ -31,4 +33,7 @@ export const listHolidaysQuerySchema = z.object({
   organizationId: z.string().optional(),
   from: isoDate.optional(),
   to: isoDate.optional(),
+  branchId: z.uuid().optional(),
+  // "true": a manager asking for the holidays that apply to themselves.
+  mine: z.enum(["true", "false"]).optional(),
 });

@@ -16,7 +16,8 @@ import {
 import { compareHash, hash } from "@/utils/hash";
 import { del, get, incrementWithExpiry, secondsLeft, set, setIfAbsent } from "@/utils/redis";
 import { sendOtp } from "@/queue/producer/sendOtp";
-import { enqueuePlatformInvoiceWhatsApp } from "@/queue/producer/sendSalarySlipWhatsApp";
+import { isVetanlyWhatsAppConfigured } from "@/services/vetanly-whatsapp";
+import { enqueuePlatformInvoiceWhatsApp } from "@/queue/producer/sendPlatformInvoiceWhatsApp";
 import {
   createPlatformInvoice,
   createPlatformPlan,
@@ -59,7 +60,7 @@ import {
 
 type AuthenticatedUser = { id: string; fname: string; lname: string; phone: string };
 
-const getActor = (c: Context): PlatformActor => {
+export const getActor = (c: Context): PlatformActor => {
   const user = c.get("user") as AuthenticatedUser;
   let ipAddress: string | null = null;
   try {
@@ -330,8 +331,8 @@ export const voidPlatformInvoiceController = async (c: Context): Promise<Respons
 };
 
 export const sendPlatformInvoiceWhatsAppController = async (c: Context): Promise<Response> => {
-  if (!env.AISENSY_API_KEY || !env.AISENSY_INVOICE_CAMPAIGN_NAME) {
-    return sendResponse(c, "error", "WhatsApp delivery is not configured. Add AISENSY_API_KEY and AISENSY_INVOICE_CAMPAIGN_NAME on the server.", null, 503);
+  if (!isVetanlyWhatsAppConfigured()) {
+    return sendResponse(c, "error", "WhatsApp delivery is not configured. Set VETANLY_WHATSAPP_URL and VETANLY_WHATSAPP_API_KEY on the server.", null, 503);
   }
   const invoiceId = c.req.param("invoiceId");
   const delivery = await getPlatformInvoiceDelivery(invoiceId);

@@ -11,6 +11,7 @@ import {
   primaryKey,
   time,
   timestamp,
+  unique,
   uniqueIndex,
   uuid,
   varchar,
@@ -45,7 +46,7 @@ export type LateFineMethod = "none" | "fixed_per_occurrence" | "per_minute";
 
 export type AttendanceEventType = "check_in" | "check_out";
 
-export type AttendanceSource = "kiosk" | "manual" | "regularization";
+export type AttendanceSource = "kiosk" | "manual" | "regularization" | "gps";
 
 export type FaceVerificationStatus = "verified" | "not_applicable" | "failed";
 
@@ -375,6 +376,11 @@ export const organizationPayrollSettingsTable = pgTable(
     autoDeductLoans: boolean("auto_deduct_loans").notNull().default(false),
     paidHolidays: boolean("paid_holidays").notNull().default(false),
     overtimeApprovalRequired: boolean("overtime_approval_required").notNull().default(false),
+    // What happens to a day worked on a weekly off or holiday nobody has decided on yet.
+    offDayWorkPolicy: varchar("off_day_work_policy", { length: 16 }).$type<OffDayWorkPolicy>().notNull().default("manager"),
+    // Pay for that day, in days' wages. For holidays it includes holiday pay already given, so 2 means double wages.
+    weeklyOffWorkMultiplier: numeric("weekly_off_work_multiplier", { precision: 4, scale: 2 }).notNull().default("1"),
+    holidayWorkMultiplier: numeric("holiday_work_multiplier", { precision: 4, scale: 2 }).notNull().default("2"),
     fullDayThresholdPercent: numeric("full_day_threshold_percent", {
       precision: 5,
       scale: 2,
@@ -395,6 +401,60 @@ export const organizationPayrollSettingsTable = pgTable(
     uniqueIndex("organization_payroll_settings_org_unique").on(
       table.organizationId,
     ),
+  ],
+);
+
+/**
+ * An office, site or store. Employees and kiosks belong to one; holidays and professional tax can
+ * differ by branch; admins and HR can be limited to some branches (branch_managers); and a branch with
+ * coordinates can let its employees check in by GPS from their phone, inside the geofence.
+ */
+export const branchesTable = pgTable(
+  "branches",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    organizationId: uuid("organization_id")
+      .notNull()
+      .references(() => organizationsTable.id),
+    name: varchar("name", { length: 100 }).notNull(),
+    code: varchar("code", { length: 32 }),
+    addressLine1: varchar("address_line1", { length: 200 }),
+    addressLine2: varchar("address_line2", { length: 200 }),
+    city: varchar("city", { length: 100 }),
+    state: varchar("state", { length: 100 }),
+    postalCode: varchar("postal_code", { length: 20 }),
+    // Professional tax slabs for this branch's state; null follows the organization's statutory setting.
+    ptState: varchar("pt_state", { length: 8 }),
+    ptFlatAmount: numeric("pt_flat_amount", { precision: 8, scale: 2 }),
+    latitude: numeric("latitude", { precision: 9, scale: 6 }),
+    longitude: numeric("longitude", { precision: 9, scale: 6 }),
+    geofenceRadiusMeters: integer("geofence_radius_meters").notNull().default(200),
+    gpsCheckIn: boolean("gps_check_in").notNull().default(false),
+    isActive: boolean("is_active").notNull().default(true),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex("branches_org_id_id_unique").on(table.organizationId, table.id),
+    uniqueIndex("branches_org_name_unique").on(table.organizationId, table.name),
+  ],
+);
+
+/** Admins and HR limited to these branches. Someone with no rows here manages the whole organization. */
+export const branchManagersTable = pgTable(
+  "branch_managers",
+  {
+    organizationId: uuid("organization_id")
+      .notNull()
+      .references(() => organizationsTable.id),
+    userOrganizationId: uuid("user_organization_id").notNull(),
+    branchId: uuid("branch_id")
+      .notNull()
+      .references(() => branchesTable.id, { onDelete: "cascade" }),
+  },
+  (table) => [
+    primaryKey({ columns: [table.userOrganizationId, table.branchId] }),
+    index("branch_managers_branch_idx").on(table.branchId),
   ],
 );
 
@@ -572,9 +632,11 @@ export const holidaysTable = pgTable(
       .references(() => organizationsTable.id),
     date: date("date").notNull(),
     name: varchar("name", { length: 100 }).notNull(),
+    // A holiday for one branch only (a state holiday); null applies to every branch.
+    branchId: uuid("branch_id").references(() => branchesTable.id, { onDelete: "cascade" }),
   },
   (table) => [
-    uniqueIndex("holidays_org_date_unique").on(table.organizationId, table.date),
+    unique("holidays_org_date_branch_unique").on(table.organizationId, table.date, table.branchId).nullsNotDistinct(),
   ],
 );
 
@@ -598,6 +660,7 @@ export const userOrganizationsTable = pgTable(
     jobTitle: varchar("job_title", { length: 100 }),
     departmentId: uuid("department_id"),
     shiftId: uuid("shift_id"),
+    branchId: uuid("branch_id"),
     employmentType: varchar("employment_type", {
       length: 24,
     }).$type<EmploymentType>(),
@@ -629,6 +692,12 @@ export const userOrganizationsTable = pgTable(
       columns: [table.organizationId, table.shiftId],
       foreignColumns: [shiftsTable.organizationId, shiftsTable.id],
     }),
+    foreignKey({
+      name: "user_organizations_branch_org_fk",
+      columns: [table.organizationId, table.branchId],
+      foreignColumns: [branchesTable.organizationId, branchesTable.id],
+    }),
+    index("user_organizations_branch_idx").on(table.branchId),
     uniqueIndex("user_organizations_org_employee_code_unique").on(
       table.organizationId,
       table.employeeCode,
@@ -663,6 +732,8 @@ export const employeeProfilesTable = pgTable(
       .notNull()
       .references(() => usersTable.id),
     dateOfBirth: date("date_of_birth"),
+    // A+, A-, B+, B-, AB+, AB-, O+ or O-. Gender is kept on the statutory profile (PT slabs use it).
+    bloodGroup: varchar("blood_group", { length: 3 }),
     addressLine1: varchar("address_line1", { length: 200 }),
     addressLine2: varchar("address_line2", { length: 200 }),
     city: varchar("city", { length: 100 }),
@@ -768,6 +839,82 @@ export const employeeExitsTable = pgTable(
   ],
 );
 
+/**
+ * Full & final settlement for a leaver (see services/settlement.services.ts): final salary, leave
+ * encashment, gratuity, notice recovery, loan recovery, unpaid expense claims and manual lines.
+ */
+export type SettlementStatus = "draft" | "finalized" | "paid" | "cancelled";
+export type SettlementLineKind =
+  | "salary"
+  | "leave_encashment"
+  | "gratuity"
+  | "reimbursement"
+  | "other_earning"
+  | "notice_recovery"
+  | "loan_recovery"
+  | "other_deduction";
+export type SettlementLine = {
+  kind: SettlementLineKind;
+  label: string;
+  amount: string;
+  // Links back to what the line settles: the loan, the expense claim, or bonuses paid with the final salary.
+  recoverableId?: string;
+  claimId?: string;
+  bonusItemIds?: string[];
+};
+/** What the preparer chose; the lines are worked out from these. */
+export type SettlementInputs = {
+  salaryFrom: string;
+  encashDays: number;
+  dailyRate: number;
+  includeGratuity: boolean;
+  waiveNoticeRecovery: boolean;
+  extraLines: { kind: "other_earning" | "other_deduction"; label: string; amount: number }[];
+  utcOffsetMinutes: number;
+};
+
+export const finalSettlementsTable = pgTable(
+  "final_settlements",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    organizationId: uuid("organization_id")
+      .notNull()
+      .references(() => organizationsTable.id),
+    userOrganizationId: uuid("user_organization_id").notNull(),
+    status: varchar("status", { length: 12 }).$type<SettlementStatus>().notNull().default("draft"),
+    lastWorkingDay: date("last_working_day", { mode: "string" }).notNull(),
+    // The final salary covers salaryFrom..lastWorkingDay; payroll runs skip the employee from salaryFrom.
+    salaryFrom: date("salary_from", { mode: "string" }).notNull(),
+    currencyCode: varchar("currency_code", { length: 3 }).notNull(),
+    inputs: jsonb("inputs").$type<SettlementInputs>().notNull(),
+    lines: jsonb("lines").$type<SettlementLine[]>().notNull().default([]),
+    // The final salary's statutory breakup (PF, ESI, PT, TDS) for reports and the statement.
+    statutory: jsonb("statutory").$type<StatutoryBreakup>(),
+    totalEarnings: numeric("total_earnings", { precision: 12, scale: 2 }).notNull().default("0"),
+    totalDeductions: numeric("total_deductions", { precision: 12, scale: 2 }).notNull().default("0"),
+    // Negative when the employee owes the company.
+    netPayable: numeric("net_payable", { precision: 12, scale: 2 }).notNull().default("0"),
+    notes: varchar("notes", { length: 1000 }),
+    preparedByUserId: uuid("prepared_by_user_id").references(() => usersTable.id),
+    finalizedByUserId: uuid("finalized_by_user_id").references(() => usersTable.id),
+    finalizedAt: timestamp("finalized_at", { withTimezone: true }),
+    paidAt: timestamp("paid_at", { withTimezone: true }),
+    paymentMethod: varchar("payment_method", { length: 30 }),
+    paymentReference: varchar("payment_reference", { length: 120 }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    foreignKey({
+      name: "final_settlements_employee_org_fk",
+      columns: [table.organizationId, table.userOrganizationId],
+      foreignColumns: [userOrganizationsTable.organizationId, userOrganizationsTable.id],
+    }),
+    index("final_settlements_org_status_idx").on(table.organizationId, table.status),
+    index("final_settlements_employee_idx").on(table.userOrganizationId),
+  ],
+);
+
 export const kioskDevicesTable = pgTable(
   "kiosk_devices",
   {
@@ -778,6 +925,7 @@ export const kioskDevicesTable = pgTable(
     deviceIdentifier: varchar("device_identifier", { length: 100 }).notNull(),
     name: varchar("name", { length: 100 }).notNull(),
     locationName: varchar("location_name", { length: 100 }),
+    branchId: uuid("branch_id").references(() => branchesTable.id, { onDelete: "set null" }),
     apiKeyHash: varchar("api_key_hash", { length: 64 }),
     appVersion: varchar("app_version", { length: 32 }),
     faceModelName: varchar("face_model_name", { length: 64 }),
@@ -880,6 +1028,12 @@ export const attendanceLogsTable = pgTable(
     faceMatchScore: numeric("face_match_score", { precision: 5, scale: 4 }),
     livenessPassed: boolean("liveness_passed"),
     faceTemplateId: uuid("face_template_id"),
+    // GPS check-ins: where the phone was, how precise it said it was, and how far from the branch.
+    latitude: numeric("latitude", { precision: 9, scale: 6 }),
+    longitude: numeric("longitude", { precision: 9, scale: 6 }),
+    accuracyMeters: integer("accuracy_meters"),
+    distanceMeters: integer("distance_meters"),
+    branchId: uuid("branch_id"),
     occurredAt: timestamp("occurred_at", { withTimezone: true }).notNull(),
     recordedAt: timestamp("recorded_at", { withTimezone: true })
       .notNull()
@@ -1014,6 +1168,12 @@ export const leaveTypesTable = pgTable(
       precision: 5,
       scale: 1,
     }),
+    // Unused days that move into the next year, at most this many; null carries nothing.
+    carryForwardMaxDays: numeric("carry_forward_max_days", { precision: 5, scale: 1 }),
+    // Compensatory off: the balance comes only from credits for days worked off-schedule.
+    isCompOff: boolean("is_comp_off").notNull().default(false),
+    // How long a comp-off credit can be used after the worked day; null never expires.
+    compOffValidityDays: integer("comp_off_validity_days"),
     isActive: boolean("is_active").notNull().default(true),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
@@ -1084,6 +1244,73 @@ export const leaveRequestsTable = pgTable(
       table.organizationId,
       table.startDate,
     ),
+  ],
+);
+
+export type OffDayWorkPolicy = "manager" | "pay" | "comp_off";
+export type OffDayOutcome = "comp_off" | "pay" | "none";
+
+/**
+ * A day worked on a weekly off or holiday: what the employee asked for and what was decided.
+ * Rows exist only once someone has requested or decided; the worked days come from attendance.
+ */
+export const offDayWorkTable = pgTable(
+  "off_day_work",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    organizationId: uuid("organization_id")
+      .notNull()
+      .references(() => organizationsTable.id),
+    userOrganizationId: uuid("user_organization_id").notNull(),
+    workDate: date("work_date").notNull(),
+    requestedOutcome: varchar("requested_outcome", { length: 16 }).$type<"comp_off" | "pay">(),
+    requestedAt: timestamp("requested_at", { withTimezone: true }),
+    outcome: varchar("outcome", { length: 16 }).$type<OffDayOutcome>(),
+    // Null with an outcome: settled automatically by the organization's policy at payroll.
+    decidedByUserId: uuid("decided_by_user_id").references(() => usersTable.id),
+    decidedAt: timestamp("decided_at", { withTimezone: true }),
+    leaveCreditId: uuid("leave_credit_id"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    foreignKey({
+      name: "off_day_work_employee_org_fk",
+      columns: [table.organizationId, table.userOrganizationId],
+      foreignColumns: [userOrganizationsTable.organizationId, userOrganizationsTable.id],
+    }),
+    uniqueIndex("off_day_work_employee_date_unique").on(table.userOrganizationId, table.workDate),
+  ],
+);
+
+/** Extra days added to a leave balance, e.g. a comp-off for working a weekly off or holiday. */
+export const leaveCreditsTable = pgTable(
+  "leave_credits",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    organizationId: uuid("organization_id")
+      .notNull()
+      .references(() => organizationsTable.id),
+    userOrganizationId: uuid("user_organization_id").notNull(),
+    leaveTypeId: uuid("leave_type_id").notNull(),
+    workedOn: date("worked_on").notNull(),
+    days: numeric("days", { precision: 3, scale: 1 }).notNull(),
+    reason: varchar("reason", { length: 300 }),
+    grantedByUserId: uuid("granted_by_user_id").references(() => usersTable.id),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    foreignKey({
+      name: "leave_credits_employee_org_fk",
+      columns: [table.organizationId, table.userOrganizationId],
+      foreignColumns: [userOrganizationsTable.organizationId, userOrganizationsTable.id],
+    }),
+    foreignKey({
+      name: "leave_credits_type_org_fk",
+      columns: [table.organizationId, table.leaveTypeId],
+      foreignColumns: [leaveTypesTable.organizationId, leaveTypesTable.id],
+    }),
+    // One credit per worked day, so the same day cannot be granted twice.
+    uniqueIndex("leave_credits_employee_type_day_unique").on(table.userOrganizationId, table.leaveTypeId, table.workedOn),
   ],
 );
 
@@ -1460,6 +1687,356 @@ export const taxDeclarationItemsTable = pgTable(
   (table) => [index("tax_declaration_items_declaration_idx").on(table.declarationId)],
 );
 
+/**
+ * Report delivery add-on (see services/messaging.services.ts). Sending documents by email or WhatsApp
+ * needs the add-on; every message is charged from the organization's prepaid wallet at the platform's
+ * per-message rates. WhatsApp goes through Vetanly's own WhatsApp service or the organization's own
+ * provider (any HTTP API). Login OTPs never use any of this: they always go through Vetanly's service.
+ */
+export type MessagingChannel = "email" | "whatsapp";
+export type MessagingProviderKind = "vetanly" | "custom_http";
+export type MessageType = "salary_slip" | "loan_noc" | "test";
+export type MessageStatus = "queued" | "sent" | "delivered" | "read" | "failed" | "simulated";
+
+/** Per-message rates in rupees; a null override follows the platform rate. */
+export type MessagingRates = { email: number; whatsappVetanly: number; whatsappCustom: number };
+
+export const platformMessagingSettingsTable = pgTable("platform_messaging_settings", {
+  id: integer("id").primaryKey().default(1),
+  emailRate: numeric("email_rate", { precision: 10, scale: 3 }).notNull().default("0"),
+  whatsappVetanlyRate: numeric("whatsapp_vetanly_rate", { precision: 10, scale: 3 }).notNull().default("0.350"),
+  whatsappCustomRate: numeric("whatsapp_custom_rate", { precision: 10, scale: 3 }).notNull().default("0.050"),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const messagingSettingsTable = pgTable("messaging_settings", {
+  organizationId: uuid("organization_id")
+    .primaryKey()
+    .references(() => organizationsTable.id),
+  addonEnabled: boolean("addon_enabled").notNull().default(false),
+  addonRequestedAt: timestamp("addon_requested_at", { withTimezone: true }),
+  // The WhatsApp provider in use; null means WhatsApp is not set up.
+  whatsappProviderId: uuid("whatsapp_provider_id"),
+  balance: numeric("balance", { precision: 14, scale: 3 }).notNull().default("0"),
+  lowBalanceThreshold: numeric("low_balance_threshold", { precision: 12, scale: 2 }).notNull().default("100"),
+  lowBalanceNotifiedAt: timestamp("low_balance_notified_at", { withTimezone: true }),
+  // Platform overrides of the per-message rates for this organization.
+  rateOverrides: jsonb("rate_overrides").$type<Partial<MessagingRates>>().notNull().default({}),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+/**
+ * A provider an organization sends through. Settings that are not secret live in config; API keys and
+ * tokens live in secrets, each value encrypted, and are never sent back to the browser.
+ */
+export type CustomHttpConfig = {
+  url: string;
+  method: "POST" | "PUT" | "GET";
+  headers: { name: string; value: string }[];
+  // JSON with {{placeholders}}; see services/messaging-template.ts.
+  bodyTemplate: string;
+  // Where the provider's message id is in its response, e.g. "data.messageId".
+  responseIdPath?: string;
+  // How to read the provider's delivery-status callbacks.
+  statusWebhook?: {
+    messageIdPath: string;
+    statusPath: string;
+    errorPath?: string;
+    statusMap: { sent?: string[]; delivered?: string[]; read?: string[]; failed?: string[] };
+  };
+};
+
+export const messagingProvidersTable = pgTable(
+  "messaging_providers",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    organizationId: uuid("organization_id")
+      .notNull()
+      .references(() => organizationsTable.id),
+    kind: varchar("kind", { length: 16 }).$type<MessagingProviderKind>().notNull(),
+    name: varchar("name", { length: 80 }).notNull(),
+    config: jsonb("config").$type<Partial<CustomHttpConfig>>().notNull().default({}),
+    secrets: jsonb("secrets").$type<Record<string, string>>().notNull().default({}),
+    // Unguessable token in this provider's status-callback URL.
+    webhookToken: varchar("webhook_token", { length: 64 }).notNull(),
+    lastTestAt: timestamp("last_test_at", { withTimezone: true }),
+    lastTestOk: boolean("last_test_ok"),
+    lastTestMessage: varchar("last_test_message", { length: 300 }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index("messaging_providers_org_idx").on(table.organizationId),
+    uniqueIndex("messaging_providers_webhook_token_unique").on(table.webhookToken),
+  ],
+);
+
+/** Which of the provider's templates each Vetanly message uses, and the variables it fills, in order. */
+export const messagingTemplatesTable = pgTable(
+  "messaging_templates",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    organizationId: uuid("organization_id")
+      .notNull()
+      .references(() => organizationsTable.id),
+    providerId: uuid("provider_id")
+      .notNull()
+      .references(() => messagingProvidersTable.id, { onDelete: "cascade" }),
+    messageType: varchar("message_type", { length: 16 }).$type<MessageType>().notNull(),
+    templateName: varchar("template_name", { length: 120 }).notNull(),
+    language: varchar("language", { length: 16 }).notNull().default("en"),
+    params: jsonb("params").$type<string[]>().notNull().default([]),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [uniqueIndex("messaging_templates_provider_type_unique").on(table.providerId, table.messageType)],
+);
+
+export const messageLogsTable = pgTable(
+  "message_logs",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    organizationId: uuid("organization_id")
+      .notNull()
+      .references(() => organizationsTable.id),
+    channel: varchar("channel", { length: 10 }).$type<MessagingChannel>().notNull(),
+    providerId: uuid("provider_id"),
+    providerKind: varchar("provider_kind", { length: 16 }).$type<MessagingProviderKind | "email">().notNull(),
+    messageType: varchar("message_type", { length: 16 }).$type<MessageType>().notNull(),
+    // The document sent: payroll item, recoverable (loan) id; null for a test.
+    relatedId: uuid("related_id"),
+    recipientUserId: uuid("recipient_user_id"),
+    // Masked for display; the real address is read from the user at send time.
+    recipientMasked: varchar("recipient_masked", { length: 80 }).notNull(),
+    // Only tests carry a typed-in destination.
+    testDestination: varchar("test_destination", { length: 20 }),
+    status: varchar("status", { length: 10 }).$type<MessageStatus>().notNull().default("queued"),
+    providerMessageId: varchar("provider_message_id", { length: 200 }),
+    error: varchar("error", { length: 500 }),
+    charge: numeric("charge", { precision: 10, scale: 3 }).notNull().default("0"),
+    refunded: boolean("refunded").notNull().default(false),
+    requestedByUserId: uuid("requested_by_user_id"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index("message_logs_org_created_idx").on(table.organizationId, table.createdAt),
+    index("message_logs_provider_message_idx").on(table.providerMessageId),
+  ],
+);
+
+export type WalletTransactionKind = "top_up" | "charge" | "refund" | "adjustment";
+
+export const walletTransactionsTable = pgTable(
+  "wallet_transactions",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    organizationId: uuid("organization_id")
+      .notNull()
+      .references(() => organizationsTable.id),
+    kind: varchar("kind", { length: 12 }).$type<WalletTransactionKind>().notNull(),
+    // Positive adds to the balance, negative takes from it.
+    amount: numeric("amount", { precision: 14, scale: 3 }).notNull(),
+    balanceAfter: numeric("balance_after", { precision: 14, scale: 3 }).notNull(),
+    messageLogId: uuid("message_log_id"),
+    reference: varchar("reference", { length: 120 }),
+    note: varchar("note", { length: 300 }),
+    createdByUserId: uuid("created_by_user_id"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [index("wallet_transactions_org_created_idx").on(table.organizationId, table.createdAt)],
+);
+
+export type TopUpStatus = "pending" | "credited" | "cancelled";
+
+/** An owner asks to add balance; the platform credits it once paid. */
+export const walletTopUpRequestsTable = pgTable(
+  "wallet_top_up_requests",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    organizationId: uuid("organization_id")
+      .notNull()
+      .references(() => organizationsTable.id),
+    amount: numeric("amount", { precision: 12, scale: 2 }).notNull(),
+    status: varchar("status", { length: 10 }).$type<TopUpStatus>().notNull().default("pending"),
+    note: varchar("note", { length: 300 }),
+    requestedByUserId: uuid("requested_by_user_id"),
+    resolvedByUserId: uuid("resolved_by_user_id"),
+    resolvedAt: timestamp("resolved_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [index("wallet_top_up_requests_status_idx").on(table.status)],
+);
+
+/**
+ * Company property handed to employees: laptops, phones, SIM cards, ID cards, vehicles, tools.
+ * available <-> assigned through asset_assignments; in_repair and retired (lost, sold, scrapped) take
+ * it out of use. A leaver's unreturned assets show on their full & final settlement.
+ */
+export type AssetCategory = "laptop" | "desktop" | "mobile" | "sim" | "id_card" | "access_card" | "vehicle" | "furniture" | "tool" | "other";
+export type AssetStatus = "available" | "assigned" | "in_repair" | "retired";
+export type AssetCondition = "new" | "good" | "fair" | "damaged";
+
+export const assetsTable = pgTable(
+  "assets",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    organizationId: uuid("organization_id")
+      .notNull()
+      .references(() => organizationsTable.id),
+    assetTag: varchar("asset_tag", { length: 40 }).notNull(),
+    name: varchar("name", { length: 120 }).notNull(),
+    category: varchar("category", { length: 16 }).$type<AssetCategory>().notNull(),
+    serialNumber: varchar("serial_number", { length: 80 }),
+    brand: varchar("brand", { length: 60 }),
+    model: varchar("model", { length: 80 }),
+    purchaseDate: date("purchase_date"),
+    purchaseCost: numeric("purchase_cost", { precision: 12, scale: 2 }),
+    warrantyUntil: date("warranty_until"),
+    branchId: uuid("branch_id").references(() => branchesTable.id, { onDelete: "set null" }),
+    condition: varchar("condition", { length: 10 }).$type<AssetCondition>().notNull().default("good"),
+    status: varchar("status", { length: 12 }).$type<AssetStatus>().notNull().default("available"),
+    // The open assignment's employee, kept here so the register needs no join to show who holds it.
+    holderMembershipId: uuid("holder_membership_id"),
+    notes: varchar("notes", { length: 500 }),
+    retiredReason: varchar("retired_reason", { length: 200 }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex("assets_org_tag_unique").on(table.organizationId, table.assetTag),
+    index("assets_org_status_idx").on(table.organizationId, table.status),
+    index("assets_holder_idx").on(table.holderMembershipId),
+  ],
+);
+
+export const assetAssignmentsTable = pgTable(
+  "asset_assignments",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    organizationId: uuid("organization_id")
+      .notNull()
+      .references(() => organizationsTable.id),
+    assetId: uuid("asset_id")
+      .notNull()
+      .references(() => assetsTable.id, { onDelete: "cascade" }),
+    userOrganizationId: uuid("user_organization_id").notNull(),
+    assignedOn: date("assigned_on").notNull(),
+    conditionOut: varchar("condition_out", { length: 10 }).$type<AssetCondition>().notNull(),
+    notesOut: varchar("notes_out", { length: 300 }),
+    assignedByUserId: uuid("assigned_by_user_id").references(() => usersTable.id),
+    // The employee confirms they received it.
+    acknowledgedAt: timestamp("acknowledged_at", { withTimezone: true }),
+    returnedOn: date("returned_on"),
+    conditionIn: varchar("condition_in", { length: 10 }).$type<AssetCondition>(),
+    notesIn: varchar("notes_in", { length: 300 }),
+    receivedByUserId: uuid("received_by_user_id").references(() => usersTable.id),
+    // Set when the asset was lost while with the employee instead of returned.
+    lost: boolean("lost").notNull().default(false),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index("asset_assignments_asset_idx").on(table.assetId),
+    index("asset_assignments_employee_idx").on(table.userOrganizationId),
+  ],
+);
+
+/** Ledger names (by key, see services/accounting-journal.ts) and how vouchers are split for cost centres. */
+export type AccountingSplit = "none" | "branch" | "department";
+
+export const accountingSettingsTable = pgTable("accounting_settings", {
+  organizationId: uuid("organization_id")
+    .primaryKey()
+    .references(() => organizationsTable.id),
+  ledgers: jsonb("ledgers").$type<Record<string, string>>().notNull().default({}),
+  splitBy: varchar("split_by", { length: 12 }).$type<AccountingSplit>().notNull().default("none"),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+/** Each download, with the vouchers in it, so the screen can warn before something is imported twice. */
+export const accountingExportsTable = pgTable(
+  "accounting_exports",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    organizationId: uuid("organization_id")
+      .notNull()
+      .references(() => organizationsTable.id),
+    format: varchar("format", { length: 8 }).notNull(),
+    fromDate: date("from_date").notNull(),
+    toDate: date("to_date").notNull(),
+    voucherKeys: jsonb("voucher_keys").$type<string[]>().notNull().default([]),
+    exportedByUserId: uuid("exported_by_user_id").references(() => usersTable.id),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [index("accounting_exports_org_idx").on(table.organizationId, table.createdAt)],
+);
+
+/**
+ * Statutory bonus under the Payment of Bonus Act, per financial year (see services/bonus.services.ts).
+ * draft -> approved -> paid; approved bonuses paid "with payroll" are picked up by the next payroll run.
+ */
+export type BonusRunStatus = "draft" | "approved" | "paid";
+export type BonusPayout = "payroll" | "direct";
+
+export const bonusRunsTable = pgTable(
+  "bonus_runs",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    organizationId: uuid("organization_id")
+      .notNull()
+      .references(() => organizationsTable.id),
+    financialYear: varchar("financial_year", { length: 7 }).notNull(),
+    status: varchar("status", { length: 12 }).$type<BonusRunStatus>().notNull().default("draft"),
+    // 8.33 (the minimum) to 20 (the maximum) per cent of bonus wages.
+    percentage: numeric("percentage", { precision: 5, scale: 2 }).notNull(),
+    // Employees earning more than this a month (basic + DA) are not covered by the Act.
+    eligibilityCeiling: numeric("eligibility_ceiling", { precision: 12, scale: 2 }).notNull(),
+    // Monthly wages counted for the bonus are capped here (7,000 or the state minimum wage, if higher).
+    calculationCeiling: numeric("calculation_ceiling", { precision: 12, scale: 2 }).notNull(),
+    payout: varchar("payout", { length: 8 }).$type<BonusPayout>().notNull().default("payroll"),
+    totalAmount: numeric("total_amount", { precision: 14, scale: 2 }).notNull().default("0"),
+    approvedByUserId: uuid("approved_by_user_id").references(() => usersTable.id),
+    approvedAt: timestamp("approved_at", { withTimezone: true }),
+    paidAt: timestamp("paid_at", { withTimezone: true }),
+    paymentReference: varchar("payment_reference", { length: 120 }),
+    createdByUserId: uuid("created_by_user_id").references(() => usersTable.id),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [uniqueIndex("bonus_runs_org_fy_unique").on(table.organizationId, table.financialYear)],
+);
+
+export const bonusItemsTable = pgTable(
+  "bonus_items",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    organizationId: uuid("organization_id")
+      .notNull()
+      .references(() => organizationsTable.id),
+    runId: uuid("run_id")
+      .notNull()
+      .references(() => bonusRunsTable.id, { onDelete: "cascade" }),
+    userOrganizationId: uuid("user_organization_id").notNull(),
+    employeeName: varchar("employee_name", { length: 120 }).notNull(),
+    eligible: boolean("eligible").notNull(),
+    // Why an employee is not eligible, or a note about how the amount was reached.
+    reason: varchar("reason", { length: 200 }),
+    monthlyWage: numeric("monthly_wage", { precision: 12, scale: 2 }).notNull().default("0"),
+    daysWorked: numeric("days_worked", { precision: 6, scale: 1 }).notNull().default("0"),
+    bonusWages: numeric("bonus_wages", { precision: 12, scale: 2 }).notNull().default("0"),
+    calculatedAmount: numeric("calculated_amount", { precision: 12, scale: 2 }).notNull().default("0"),
+    // What is actually paid; starts at the calculated amount and can be adjusted before approval.
+    finalAmount: numeric("final_amount", { precision: 12, scale: 2 }).notNull().default("0"),
+    included: boolean("included").notNull().default(true),
+    // Set when a finalized payroll run paid it.
+    paidInPayrollRunId: uuid("paid_in_payroll_run_id"),
+    paidAt: timestamp("paid_at", { withTimezone: true }),
+  },
+  (table) => [
+    index("bonus_items_run_idx").on(table.runId),
+    index("bonus_items_employee_idx").on(table.userOrganizationId),
+  ],
+);
+
 export const payrollRunsTable = pgTable(
   "payroll_runs",
   {
@@ -1507,6 +2084,8 @@ export const payrollItemsTable = pgTable(
     employeeCode: varchar("employee_code", { length: 32 }),
     jobTitle: varchar("job_title", { length: 100 }),
     departmentName: varchar("department_name", { length: 100 }),
+    branchId: uuid("branch_id"),
+    branchName: varchar("branch_name", { length: 100 }),
     compensationType: varchar("compensation_type", { length: 16 })
       .$type<CompensationType>()
       .notNull(),
@@ -1542,6 +2121,13 @@ export const payrollItemsTable = pgTable(
     // Approved expense claims paid back with this salary. Added to net pay, outside gross and deductions.
     reimbursements: numeric("reimbursements", { precision: 12, scale: 2 }).notNull().default("0"),
     reimbursementLines: jsonb("reimbursement_lines").$type<PayrollReimbursementLine[]>().notNull().default([]),
+    // Statutory bonus paid with this salary: inside gross (taxable), outside PF, ESI and PT wages.
+    bonus: numeric("bonus", { precision: 12, scale: 2 }).notNull().default("0"),
+    // Days worked on a weekly off or holiday and paid for, and that pay; pending ones await a decision.
+    offDayDays: numeric("off_day_days", { precision: 5, scale: 1 }).notNull().default("0"),
+    offDayPay: numeric("off_day_pay", { precision: 12, scale: 2 }).notNull().default("0"),
+    offDayPendingDays: numeric("off_day_pending_days", { precision: 5, scale: 1 }).notNull().default("0"),
+    bonusLines: jsonb("bonus_lines").$type<{ bonusItemId: string; label: string; amount: string }[]>().notNull().default([]),
     statutory: jsonb("statutory").$type<StatutoryBreakup>(),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()

@@ -42,6 +42,9 @@ const DAY_MS = 86_400_000;
 // Paid dates are calendar days for Indian customers, so a paid day ends at midnight IST.
 const BUSINESS_UTC_OFFSET = "+05:30";
 
+/** The calendar date in India for an instant. */
+const indiaDate = (instant: Date) => new Date(instant.getTime() + 330 * 60_000).toISOString().slice(0, 10);
+
 const endOfPaidDay = (date: string) => new Date(`${date}T23:59:59.999${BUSINESS_UTC_OFFSET}`);
 
 export const computeAccess = (
@@ -64,7 +67,10 @@ export const computeAccess = (
   const ends = [input.trialEndsAt, paidEnd].filter((end): end is Date => end !== null);
   const accessEnd = ends.length ? new Date(Math.max(...ends.map((end) => end.getTime()))) : new Date(0);
   const graceEnd = new Date(accessEnd.getTime() + GRACE_DAYS * DAY_MS);
-  const daysUntil = (when: Date) => Math.max(0, Math.ceil((when.getTime() - now.getTime()) / DAY_MS));
+  // Whole calendar days in India time, so the count drops by one each midnight IST and the last
+  // day reads 0 ("ends today"). Rounding hours up instead kept a trial started in the afternoon
+  // at 14 days for most of the next day.
+  const daysUntil = (when: Date) => Math.max(0, Math.round((Date.parse(indiaDate(when)) - Date.parse(indiaDate(now))) / DAY_MS));
 
   let state: AccessState;
   let daysLeft: number;

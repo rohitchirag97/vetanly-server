@@ -3,6 +3,7 @@ import { Hono } from "hono";
 import {
   enrollFaceTemplateController,
   kioskDeviceInfoController,
+  listKioskEmployeesController,
   listEmployeeTemplatesController,
   revokeEmployeeTemplatesController,
   syncFaceTemplatesController,
@@ -14,6 +15,7 @@ const faceTemplateRoutes: Hono = new Hono();
 
 faceTemplateRoutes.post("/enroll", authenticateKioskMiddleware, enrollFaceTemplateController);
 faceTemplateRoutes.get("/sync", authenticateKioskMiddleware, syncFaceTemplatesController);
+faceTemplateRoutes.get("/employees", authenticateKioskMiddleware, listKioskEmployeesController);
 faceTemplateRoutes.post("/device-info", authenticateKioskMiddleware, kioskDeviceInfoController);
 faceTemplateRoutes.get("/employee/:employeeId", authenticate, listEmployeeTemplatesController);
 faceTemplateRoutes.delete("/employee/:employeeId", authenticate, revokeEmployeeTemplatesController);

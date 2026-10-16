@@ -1,6 +1,14 @@
 import { Hono } from "hono";
 
 import { authenticate } from "@/middleware/authenticate.middleware";
+import {
+  platformCancelTopUpController,
+  platformCreditController,
+  platformMessagingController,
+  platformOrgMessagingController,
+  platformRatesController,
+  platformSetOrgMessagingController,
+} from "@/controller/platform-messaging.controller";
 import { platformRateLimit, requirePlatformAdmin } from "@/middleware/platform-admin.middleware";
 import {
   addPlatformNoteController,
@@ -58,6 +66,12 @@ platformRoutes.get("/invoices/:invoiceId/pdf", ...protect, getPlatformInvoicePdf
 platformRoutes.get("/invoices/:invoiceId", ...protect, getPlatformInvoiceController);
 platformRoutes.post("/invoices/:invoiceId/paid", ...protect, markPlatformInvoicePaidController);
 platformRoutes.post("/invoices/:invoiceId/void", ...protect, voidPlatformInvoiceController);
+platformRoutes.get("/messaging", ...protect, platformMessagingController);
+platformRoutes.put("/messaging/rates", ...protect, platformRatesController);
+platformRoutes.post("/messaging/top-ups/:requestId/cancel", ...protect, platformCancelTopUpController);
+platformRoutes.get("/organizations/:organizationId/messaging", ...protect, platformOrgMessagingController);
+platformRoutes.put("/organizations/:organizationId/messaging", ...protect, platformSetOrgMessagingController);
+platformRoutes.post("/organizations/:organizationId/messaging/credit", ...protect, platformCreditController);
 platformRoutes.post("/invoices/:invoiceId/send-whatsapp", ...protect, sendPlatformInvoiceWhatsAppController);
 
 export default platformRoutes;

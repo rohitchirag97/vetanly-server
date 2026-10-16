@@ -7,11 +7,22 @@ import {
   updateLeaveStatus,
   updateLeaveType,
 } from "@/services/leave.services";
+import {
+  decideOffDayWork,
+  listLeaveCredits,
+  listOffDayWork,
+  requestOffDayOutcome,
+  revokeLeaveCredit,
+} from "@/services/off-day-work.services";
 import { withBody, withOrganization, withParam, withQuery } from "@/utils/controller";
 import { respond } from "@/utils/result";
 import {
   createLeaveRequestSchema,
   createLeaveTypeSchema,
+  decideOffDayWorkSchema,
+  leaveCreditQuerySchema,
+  offDayWorkQuerySchema,
+  requestOffDayOutcomeSchema,
   listLeaveQuerySchema,
   updateLeaveStatusSchema,
   updateLeaveTypeSchema,
@@ -60,5 +71,33 @@ export const leaveBalancesController = withOrganization(async (c, { organization
     c,
     await getLeaveBalances(organizationId, userId, new Date().getFullYear()),
     "Leave balances fetched",
+  ),
+);
+
+export const listLeaveCreditsController = withOrganization((c, { organizationId, userId }) =>
+  withQuery(c, leaveCreditQuerySchema, async (query) =>
+    respond(c, await listLeaveCredits(organizationId, userId, query), "Leave credits fetched"),
+  ),
+);
+
+export const revokeLeaveCreditController = withOrganization((c, { organizationId, userId }) =>
+  withParam(c, "creditId", async (id) => respond(c, await revokeLeaveCredit(organizationId, userId, id), "Credit removed")),
+);
+
+export const listOffDayWorkController = withOrganization((c, { organizationId, userId }) =>
+  withQuery(c, offDayWorkQuerySchema, async (query) =>
+    respond(c, await listOffDayWork(organizationId, userId, query), "Work on off days fetched"),
+  ),
+);
+
+export const requestOffDayOutcomeController = withOrganization((c, { organizationId, userId }) =>
+  withBody(c, requestOffDayOutcomeSchema, async (body) =>
+    respond(c, await requestOffDayOutcome(organizationId, userId, body), "Request sent"),
+  ),
+);
+
+export const decideOffDayWorkController = withOrganization((c, { organizationId, userId }) =>
+  withBody(c, decideOffDayWorkSchema, async (body) =>
+    respond(c, await decideOffDayWork(organizationId, userId, body), "Decision saved"),
   ),
 );

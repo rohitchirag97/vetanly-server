@@ -24,6 +24,9 @@ export const payrollSettingsSchema = z
     autoDeductLoans: z.boolean().default(false),
     paidHolidays: z.boolean().default(false),
     overtimeApprovalRequired: z.boolean().default(false),
+    offDayWorkPolicy: z.enum(["manager", "pay", "comp_off"]).default("manager"),
+    weeklyOffWorkMultiplier: z.number().min(0).max(5).default(1),
+    holidayWorkMultiplier: z.number().min(0).max(5).default(2),
     fullDayThresholdPercent: z.number().gt(0).max(100).default(90),
     halfDayThresholdPercent: z.number().gt(0).max(100).default(50),
   })

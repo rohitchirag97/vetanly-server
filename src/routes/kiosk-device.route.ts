@@ -1,7 +1,12 @@
 import { Hono } from "hono";
 
 import {
+  claimPairingCodeController,
+  createEnrollmentCodeController,
   createKioskController,
+  createPairingCodeController,
+  unlockEnrollmentController,
+  unpairKioskController,
   kioskHeartbeatController,
   listKiosksController,
   rotateKioskKeyController,
@@ -13,6 +18,11 @@ import { authenticateKioskMiddleware } from "@/middleware/authenticate-kiosk.mid
 const kioskRoutes: Hono = new Hono();
 
 kioskRoutes.post("/heartbeat", authenticateKioskMiddleware, kioskHeartbeatController);
+kioskRoutes.post("/pair", claimPairingCodeController);
+kioskRoutes.post("/:kioskId/pairing-code", authenticate, createPairingCodeController);
+kioskRoutes.post("/:kioskId/unpair", authenticate, unpairKioskController);
+kioskRoutes.post("/:kioskId/enrollment-code", authenticate, createEnrollmentCodeController);
+kioskRoutes.post("/enrollment/unlock", authenticateKioskMiddleware, unlockEnrollmentController);
 kioskRoutes.get("/", authenticate, listKiosksController);
 kioskRoutes.post("/", authenticate, createKioskController);
 kioskRoutes.patch("/:kioskId", authenticate, updateKioskController);

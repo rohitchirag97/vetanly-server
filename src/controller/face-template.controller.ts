@@ -3,6 +3,7 @@ import type { Context } from "hono";
 import {
   enrollFaceTemplate,
   listEmployeeTemplates,
+  listKioskEmployees,
   revokeEmployeeTemplates,
   syncFaceTemplates,
   updateKioskDeviceInfo,
@@ -24,6 +25,9 @@ export const syncFaceTemplatesController = (c: Context) =>
   withQuery(c, syncFaceTemplatesQuerySchema, async (query) =>
     respond(c, await syncFaceTemplates(c.get("kiosk"), query), "Face templates fetched"),
   );
+
+export const listKioskEmployeesController = async (c: Context) =>
+  respond(c, await listKioskEmployees(c.get("kiosk")), "Employees fetched");
 
 export const kioskDeviceInfoController = (c: Context) =>
   withBody(c, kioskDeviceInfoSchema, async (body) => {

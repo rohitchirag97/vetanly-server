@@ -9,18 +9,13 @@ import {
   UserRole,
   userOrganizationsTable,
 } from "@/drizzle/schema";
-import { PEOPLE_MANAGER_ROLES, requireRole } from "@/services/access.services";
+import { canManageMember, PEOPLE_MANAGER_ROLES, requireRole } from "@/services/access.services";
 import { computeDailyAttendance } from "@/services/attendance.services";
 import { notify } from "@/services/notification.services";
 import { fail, ok } from "@/utils/result";
 import type { listOvertimeQuerySchema, reviewOvertimeSchema } from "@/validator/overtime.validator";
 
 export type OvertimeStatus = "pending" | "approved" | "rejected" | "auto";
-
-const earnedOvertime = (day: { status: string; workedMinutes: number | null; expectedMinutes: number | null }) =>
-  day.status === "present" && day.workedMinutes !== null && day.expectedMinutes
-    ? Math.max(0, day.workedMinutes - day.expectedMinutes)
-    : 0;
 
 const approvalRequired = async (organizationId: string) => {
   const [row] = await db
@@ -44,6 +39,7 @@ export const listOvertime = async (
     computeDailyAttendance(organizationId, {
       ...query,
       employeeRole: access.data.role === UserRole.HR ? UserRole.EMPLOYEE : undefined,
+      branchIds: access.data.branchIds ?? undefined,
     }),
     db
       .select()
@@ -64,7 +60,7 @@ export const listOvertime = async (
   const decisionByKey = new Map(decisions.map((d) => [`${d.userOrganizationId}|${d.date}`, d]));
 
   const rows = days
-    .map((day) => ({ day, minutes: earnedOvertime(day) }))
+    .map((day) => ({ day, minutes: day.overtimeMinutes }))
     .filter(({ minutes }) => minutes > 0)
     .map(({ day, minutes }) => {
       const decision = decisionByKey.get(`${memberByUser.get(day.employeeId)}|${day.date}`);
@@ -101,7 +97,7 @@ export const reviewOvertime = async (
   const saved: string[] = [];
   for (const entry of input.entries) {
     const [member] = await db
-      .select({ id: userOrganizationsTable.id, role: userOrganizationsTable.role })
+      .select({ id: userOrganizationsTable.id, role: userOrganizationsTable.role, branchId: userOrganizationsTable.branchId })
       .from(userOrganizationsTable)
       .where(
         and(
@@ -111,9 +107,7 @@ export const reviewOvertime = async (
       )
       .limit(1);
     if (!member) return fail("not-found", "Employee not found in this organization");
-    if (access.data.role === UserRole.HR && member.role !== UserRole.EMPLOYEE) {
-      return fail("forbidden");
-    }
+    if (!canManageMember(access.data, member)) return fail("forbidden");
 
     const [finalized] = await db
       .select({ id: payrollRunsTable.id })
@@ -135,7 +129,7 @@ export const reviewOvertime = async (
       employeeId: entry.employeeId,
       utcOffsetMinutes: input.utcOffsetMinutes,
     });
-    const earned = day ? earnedOvertime(day) : 0;
+    const earned = day ? day.overtimeMinutes : 0;
     if (earned <= 0) return fail("invalid", `No overtime on ${entry.date}`);
 
     const minutes = entry.status === "approved" ? Math.min(entry.approvedMinutes ?? earned, earned) : 0;

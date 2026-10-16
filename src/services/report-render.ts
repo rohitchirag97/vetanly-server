@@ -81,7 +81,10 @@ const buildTablePdf = (table: ReportTable): Promise<Buffer> =>
     const weights = table.columns.map((column) => column.width ?? 14);
     const totalWeight = weights.reduce((a, b) => a + b, 0);
     const widths = weights.map((weight) => (weight / totalWeight) * usable);
-    const rowHeight = 18;
+    // Wide registers (31 day columns, 23 wage columns) need a smaller font to fit on one landscape page.
+    const fontSize = table.compact ? 6.5 : 8;
+    const pad = table.compact ? 1.5 : 3;
+    const rowHeight = table.compact ? 15 : 18;
     const bottom = () => doc.page.height - margin - 14;
 
     const drawRow = (cells: ReportCell[], y: number, style: "head" | "body" | "total") => {
@@ -89,11 +92,11 @@ const buildTablePdf = (table: ReportTable): Promise<Buffer> =>
       doc
         .fillColor(style === "head" ? "#FFFFFF" : "#111111")
         .font(style === "body" ? "Helvetica" : "Helvetica-Bold")
-        .fontSize(8);
+        .fontSize(fontSize);
       let x = margin;
       cells.forEach((cell, index) => {
-        doc.text(String(fmt(cell)), x + 3, y, {
-          width: widths[index] - 6,
+        doc.text(String(fmt(cell)), x + pad, y, {
+          width: widths[index] - pad * 2,
           height: rowHeight - 4,
           ellipsis: true,
           lineBreak: false,
@@ -155,6 +158,8 @@ const buildTablePdf = (table: ReportTable): Promise<Buffer> =>
     const range = doc.bufferedPageRange();
     for (let i = 0; i < range.count; i++) {
       doc.switchToPage(range.start + i);
+      // The page number sits below the bottom margin; without this pdfkit would start a new page for it.
+      doc.page.margins.bottom = 0;
       doc
         .fillColor("#777777")
         .font("Helvetica")

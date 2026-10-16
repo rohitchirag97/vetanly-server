@@ -1,6 +1,8 @@
 import type {
   CompensationType,
   LateFineMethod,
+  OffDayOutcome,
+  OffDayWorkPolicy,
   OvertimeCalculationMethod,
   SalaryComponent,
 } from "@/drizzle/schema";
@@ -29,6 +31,9 @@ export type CalcSettings = {
   autoDeductLoans: boolean;
   paidHolidays: boolean;
   overtimeApprovalRequired: boolean;
+  offDayWorkPolicy: OffDayWorkPolicy;
+  weeklyOffWorkMultiplier: number;
+  holidayWorkMultiplier: number;
 };
 
 export type CalcLeave = { startDate: string; endDate: string; isHalfDay: boolean; isPaid: boolean };
@@ -60,6 +65,10 @@ export type CalcInput = {
    * A rostered date replaces the company weekly off for that date; dates not listed keep it.
    */
   rosterDays?: Map<string, "work" | "off">;
+  /** Decisions for days worked on a weekly off or holiday, by date; undecided days follow the policy. */
+  offDayOutcomes?: Map<string, OffDayOutcome>;
+  /** A bonus paid with this salary: taxable, but not wages for PF, ESI or professional tax. */
+  bonusCents?: number;
   statutory?: { settings: StatutorySettings; employee: EmployeeStatutory; ytd: YearToDate };
 };
 
@@ -78,6 +87,12 @@ export type CalcResult = {
   basePayCents: number;
   overtimePayCents: number;
   allowancesPayCents: number;
+  bonusPayCents: number;
+  /** Paid off-day work: days (half days count 0.5) and their pay. */
+  offDayDays: number;
+  offDayPayCents: number;
+  /** Worked off-days with no decision yet, so not paid in this run. */
+  offDayPending: { date: string; days: number }[];
   grossPayCents: number;
   lateFineCents: number;
   componentDeductionsCents: number;
@@ -95,6 +110,17 @@ const DEFAULT_DAY_HOURS = 8;
 const cents = (value: number) => Math.round(value * 100);
 
 const weekdayOf = (date: string) => new Date(`${date}T00:00:00Z`).getUTCDay();
+
+/**
+ * Minutes worked after the shift break. Shifts store only the break's length, not when it is
+ * taken, so the break is deducted in proportion to how much of the shift was covered: a full
+ * shift loses the whole break, a one-hour visit only a few minutes of it.
+ */
+export const workedAfterBreak = (elapsedMinutes: number, shiftSpanMinutes: number, breakMinutes: number) => {
+  const breakTaken =
+    shiftSpanMinutes > 0 ? Math.min(breakMinutes, Math.round((breakMinutes * elapsedMinutes) / shiftSpanMinutes)) : breakMinutes;
+  return Math.max(0, elapsedMinutes - breakTaken);
+};
 
 export const eachDate = (from: string, to: string): string[] => {
   const dates: string[] = [];
@@ -149,11 +175,26 @@ export const calculatePayroll = (input: CalcInput): CalcResult => {
   let lateMinutes = 0;
 
   const holidaySet = new Set(input.holidays);
+  const offDayWork: { kind: "weekly_off" | "holiday"; days: number; minutes: number }[] = [];
+  const offDayPending: CalcResult["offDayPending"] = [];
 
   for (const date of eachDate(input.periodStart, input.periodEnd)) {
     const rostered = input.rosterDays?.get(date);
-    if (rostered === "off") continue;
-    if (rostered !== "work" && settings.weeklyOffDays.includes(weekdayOf(date))) continue;
+    const weeklyOff = rostered === "off" || (rostered !== "work" && settings.weeklyOffDays.includes(weekdayOf(date)));
+    // Work on an off day is paid only when decided (or the policy says) "pay"; comp-off and "none" are not.
+    if (weeklyOff || holidaySet.has(date)) {
+      const worked = dayMap.get(date);
+      const days = worked?.status === "present" ? 1 : worked?.status === "half_day" ? 0.5 : 0;
+      if (days > 0 && (!input.hireDate || date >= input.hireDate)) {
+        const outcome = input.offDayOutcomes?.get(date) ?? (settings.offDayWorkPolicy === "pay" ? "pay" : null);
+        if (outcome === "pay") {
+          offDayWork.push({ kind: holidaySet.has(date) ? "holiday" : "weekly_off", days, minutes: worked?.workedMinutes ?? 0 });
+        } else if (outcome === null) {
+          offDayPending.push({ date, days });
+        }
+      }
+    }
+    if (weeklyOff) continue;
     if (holidaySet.has(date)) {
       if (settings.paidHolidays) {
         workingDays += 1;
@@ -177,12 +218,9 @@ export const calculatePayroll = (input: CalcInput): CalcResult => {
       if (day.status === "present") {
         present += 1;
         payable += 1;
-        if (day.workedMinutes !== null && day.expectedMinutes) {
-          const extra = Math.max(0, day.workedMinutes - day.expectedMinutes);
-          overtimeMinutes += settings.overtimeApprovalRequired
-            ? Math.min(extra, input.overtimeApprovals?.get(date) ?? 0)
-            : extra;
-        }
+        overtimeMinutes += settings.overtimeApprovalRequired
+          ? Math.min(day.overtimeMinutes, input.overtimeApprovals?.get(date) ?? 0)
+          : day.overtimeMinutes;
       } else if (day.status === "half_day") {
         half += 1;
         payable += 0.5;
@@ -238,6 +276,18 @@ export const calculatePayroll = (input: CalcInput): CalcResult => {
   const basePayCents = cents(basePay);
   const overtimePayCents = cents(overtimePay);
 
+  // A paid holiday already earned one day's pay, so working it adds the multiplier minus that day.
+  const offDayPay = offDayWork.reduce((total, work) => {
+    const multiplier = Math.max(
+      0,
+      work.kind === "holiday"
+        ? settings.holidayWorkMultiplier - (settings.paidHolidays ? 1 : 0)
+        : settings.weeklyOffWorkMultiplier,
+    );
+    return total + (type === "hourly" ? (work.minutes / 60) * hourlyRate : perDayRate * work.days) * multiplier;
+  }, 0);
+  const offDayPayCents = cents(offDayPay);
+
   // Allowances are monthly amounts prorated by attendance; percentages apply to the
   // base pay actually earned. Deductions are not prorated, but never exceed what remains.
   const attendanceRatio = workingDays > 0 ? Math.min(payable / workingDays, 1) : 1;
@@ -253,7 +303,9 @@ export const calculatePayroll = (input: CalcInput): CalcResult => {
     }
   }
   const allowancesPayCents = earningLines.reduce((sum, line) => sum + line.amountCents, 0);
-  const grossPayCents = basePayCents + overtimePayCents + allowancesPayCents;
+  // A bonus is paid inside gross (it is taxable) but stays out of PF, ESI and professional tax wages.
+  const bonusPayCents = Math.max(0, Math.round(input.bonusCents ?? 0));
+  const grossPayCents = basePayCents + overtimePayCents + offDayPayCents + allowancesPayCents + bonusPayCents;
 
   let fineCents = 0;
   if (settings.lateFineMethod === "fixed_per_occurrence") {
@@ -274,7 +326,7 @@ export const calculatePayroll = (input: CalcInput): CalcResult => {
   let breakup: StatutoryBreakup | null = null;
   const duplicates: RegExp[] = [];
   if (stat) {
-    const gross = grossPayCents / 100;
+    const gross = (grossPayCents - bonusPayCents) / 100;
     const entitlement = fullMonthEntitlement({
       type,
       amount,
@@ -286,7 +338,7 @@ export const calculatePayroll = (input: CalcInput): CalcResult => {
     const esi = computeEsi(gross, entitlement, stat.settings, stat.employee);
     const professionalTax = computeProfessionalTax(gross, input.periodEnd, stat.settings, stat.employee);
     // Deductions that reduce taxable pay are already inside gross; PT is passed separately.
-    const tds = computeMonthlyTds(gross, input.periodEnd, professionalTax, stat.settings, stat.employee, stat.ytd);
+    const tds = computeMonthlyTds(gross, input.periodEnd, professionalTax, stat.settings, stat.employee, stat.ytd, bonusPayCents / 100);
     breakup = {
       ...emptyBreakup(stat.employee.taxRegime),
       ...pf,
@@ -351,6 +403,10 @@ export const calculatePayroll = (input: CalcInput): CalcResult => {
     basePayCents,
     overtimePayCents,
     allowancesPayCents,
+    bonusPayCents,
+    offDayDays: offDayWork.reduce((total, work) => total + work.days, 0),
+    offDayPayCents,
+    offDayPending,
     grossPayCents,
     lateFineCents: fineCents,
     componentDeductionsCents,

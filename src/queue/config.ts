@@ -5,6 +5,7 @@ export const queueNames = {
   attendance: "attendanceQueue",
   whatsapp: "whatsappQueue",
   email: "emailQueue",
+  messaging: "messagingQueue",
 } as const;
 
 /** Return connection options per BullMQ instance. */

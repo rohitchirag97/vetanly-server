@@ -11,7 +11,7 @@ import {
   userOrganizationsTable,
   usersTable,
 } from "@/drizzle/schema";
-import { PEOPLE_MANAGER_ROLES, OWNER_ROLES, requireRole } from "@/services/access.services";
+import { branchCondition, canManageMember, PEOPLE_MANAGER_ROLES, OWNER_ROLES, requireRole } from "@/services/access.services";
 import {
   EMPTY_YTD,
   financialYearOf,
@@ -157,6 +157,7 @@ export const listEmployeeStatutory = async (organizationId: string, requesterId:
         access.data.role === UserRole.HR
           ? eq(userOrganizationsTable.role, UserRole.EMPLOYEE)
           : undefined,
+        branchCondition(access.data),
       ),
     )
     .orderBy(usersTable.fname, usersTable.lname);
@@ -182,7 +183,7 @@ export const saveEmployeeStatutory = async (
   const access = await requireRole(organizationId, requesterId, PEOPLE_MANAGER_ROLES);
   if (!access.ok) return access;
   const [member] = await db
-    .select({ id: userOrganizationsTable.id, role: userOrganizationsTable.role })
+    .select({ id: userOrganizationsTable.id, role: userOrganizationsTable.role, branchId: userOrganizationsTable.branchId })
     .from(userOrganizationsTable)
     .where(
       and(
@@ -192,9 +193,7 @@ export const saveEmployeeStatutory = async (
     )
     .limit(1);
   if (!member) return fail("not-found", "Employee not found in this organization");
-  if (access.data.role === UserRole.HR && member.role !== UserRole.EMPLOYEE) {
-    return fail("forbidden");
-  }
+  if (!canManageMember(access.data, member)) return fail("forbidden");
 
   const values: Partial<typeof profiles.$inferInsert> = { updatedAt: new Date() };
   if (input.uan !== undefined) values.uan = input.uan || null;

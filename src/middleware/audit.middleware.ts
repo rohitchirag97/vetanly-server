@@ -13,7 +13,7 @@ const READ_ONLY_POSTS = new Set([`${API_PREFIX}/employee/bulk/check`]);
 
 type Body = Record<string, unknown>;
 
-const clientIp = (c: Context): string | null => {
+export const clientIp = (c: Context): string | null => {
   try {
     return getConnInfo(c).remote.address ?? null;
   } catch {

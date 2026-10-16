@@ -25,6 +25,7 @@ export const updateEmploymentSchema = z
     jobTitle: text(100),
     departmentId: z.uuid().nullable().optional(),
     shiftId: z.uuid().nullable().optional(),
+    branchId: z.uuid().nullable().optional(),
     employmentType: z
       .enum(["full_time", "part_time", "contractor", "intern"])
       .nullable()

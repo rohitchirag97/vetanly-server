@@ -60,6 +60,7 @@ const PARAM_BY_RESOURCE: Record<string, string> = {
   shift: "shiftId",
   holiday: "holidayId",
   "kiosk-device": "kioskId",
+  settlements: "employeeId",
 };
 
 // Route params are not known to a catch-all middleware before the handler runs.
@@ -266,6 +267,55 @@ const describers: Record<string, Describe> = {
     text: `${body.approve ? "approved" : "rejected"} a shift swap`,
     extra: { reason: str(body.note) },
   }),
+
+  "PUT /settlements/:employeeId": ({ t }) => ({ text: `saved the full & final settlement draft of ${who(t)}` }),
+  "DELETE /settlements/:employeeId": ({ t }) => ({ text: `discarded the full & final settlement draft of ${who(t)}` }),
+  "POST /settlements/:employeeId/finalize": ({ t }) => ({ text: `finalized the full & final settlement of ${who(t)}` }),
+  "POST /settlements/:employeeId/paid": ({ t, body }) => ({
+    text: `marked the full & final settlement of ${who(t)} as paid (${str(body.paymentMethod) ?? ""})`,
+  }),
+
+  "POST /assets": ({ body }) => ({ text: `added asset ${str(body.assetTag) ?? ""} "${str(body.name) ?? ""}"` }),
+  "PUT /assets/:assetId": ({ body }) => ({ text: `updated asset ${str(body.assetTag) ?? ""}` }),
+  "DELETE /assets/:assetId": () => ({ text: "deleted an asset" }),
+  "POST /assets/:assetId/assign": ({ t }) => ({ text: `handed an asset to ${who(t)}` }),
+  "POST /assets/:assetId/return": ({ body }) => ({ text: body.lost ? "recorded an asset as lost" : "took an asset back" }),
+  "POST /assets/:assetId/status": ({ body }) => ({
+    text: `set an asset to ${str(body.status)?.replace("_", " ") ?? ""}`,
+    extra: { reason: str(body.reason) },
+  }),
+  "POST /assets/assignments/:assignmentId/acknowledge": () => ({ text: "confirmed receiving an asset" }),
+  "POST /messaging/addon-request": () => ({ text: "requested the email and WhatsApp delivery add-on" }),
+  "PUT /messaging/provider/vetanly": () => ({ text: "chose Vetanly WhatsApp for sending" }),
+  "PUT /messaging/provider/custom": ({ body }) => ({ text: `saved their own WhatsApp provider "${str(body.name) ?? ""}"` }),
+  "DELETE /messaging/provider": () => ({ text: "removed the WhatsApp provider" }),
+  "PUT /messaging/templates": () => ({ text: "updated the WhatsApp template mapping" }),
+  "POST /messaging/test": () => ({ text: "sent a WhatsApp test message" }),
+  "PUT /messaging/low-balance": ({ body }) => ({ text: `set the low-balance warning to ₹${typeof body.threshold === "number" ? body.threshold : ""}` }),
+  "POST /messaging/top-up-requests": ({ body }) => ({ text: `requested a messaging top-up of ₹${typeof body.amount === "number" ? body.amount : ""}` }),
+  "PUT /accounting/settings": () => ({ text: "updated the accounting ledger names" }),
+  "POST /accounting/journal/export": ({ body }) => ({
+    text: `exported accounting journals for ${str(body.from) ?? ""} to ${str(body.to) ?? ""} (${str(body.format) ?? ""})`,
+  }),
+  "POST /branches": ({ body }) => ({ text: `created branch "${str(body.name) ?? ""}"` }),
+  "PUT /branches/:branchId": ({ body }) => ({
+    text: `updated branch "${str(body.name) ?? ""}"${body.gpsCheckIn ? ` (GPS check-in within ${typeof body.geofenceRadiusMeters === "number" ? body.geofenceRadiusMeters : ""} m)` : ""}`,
+  }),
+  "PATCH /branches/:branchId/status": ({ body }) => ({ text: body.isActive ? "reopened a branch" : "closed a branch" }),
+  "PUT /branches/:branchId/managers": ({ body }) => ({
+    text: `set the managers of a branch (${Array.isArray(body.employeeIds) ? body.employeeIds.length : 0} people)`,
+  }),
+  "POST /attendance/gps": ({ body }) => ({ text: body.eventType === "check_out" ? "checked out by GPS" : "checked in by GPS" }),
+
+  "POST /bonus/runs": ({ body }) => ({
+    text: `calculated the ${str(body.financialYear) ?? ""} bonus at ${typeof body.percentage === "number" ? body.percentage : ""}%`,
+  }),
+  "PATCH /bonus/runs/:runId/items/:itemId": ({ body }) => ({
+    text: body.included === false ? "left an employee out of the bonus" : `adjusted an employee's bonus${typeof body.finalAmount === "number" ? ` to ${body.finalAmount}` : ""}`,
+  }),
+  "POST /bonus/runs/:runId/approve": () => ({ text: "approved the year's bonus" }),
+  "POST /bonus/runs/:runId/paid": () => ({ text: "marked the year's bonus as paid" }),
+  "DELETE /bonus/runs/:runId": () => ({ text: "deleted a draft bonus run" }),
 
   "POST /attendance/manual": ({ t }) => ({ text: `marked attendance manually for ${who(t)}` }),
   "DELETE /face-template/employee/:employeeId": ({ t }) => ({ text: `revoked the face data of ${who(t)}` }),

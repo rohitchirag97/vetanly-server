@@ -3,8 +3,10 @@ import type { z } from "zod";
 
 import db from "@/utils/db";
 import {
+  branchesTable,
   departmentsTable,
   employeeRecoverableRepaymentsTable as repayments,
+  finalSettlementsTable,
   employeeRecoverablesTable as recoverables,
   leaveRequestsTable,
   leaveTypesTable,
@@ -18,19 +20,20 @@ import {
   UserRole,
   usersTable,
 } from "@/drizzle/schema";
-import { ALL_ROLES, MANAGER_ROLES, requireRole } from "@/services/access.services";
+import { ALL_ROLES, isOrganizationManager, MANAGER_ROLES, requireRole } from "@/services/access.services";
 import { computeDailyAttendance } from "@/services/attendance.services";
 import { notify } from "@/services/notification.services";
-import { enqueueSalarySlipWhatsApp } from "@/queue/producer/sendSalarySlipWhatsApp";
-import { enqueueSalarySlipEmail } from "@/queue/producer/sendDocumentEmail";
+import { queueDelivery, sendableChannels } from "@/services/messaging.services";
+import { maskEmail, maskPhone } from "@/services/messaging-template";
 import { deliveryChannels } from "@/services/user.services";
 import { requireFullAccess } from "@/services/billing-access.services";
 import { CATEGORY_LABELS, loadReimbursableClaims, settleClaimsInPayroll } from "@/services/expense.services";
+import { loadPayrollBonuses, settleBonusesInPayroll, type PayrollBonusLine } from "@/services/bonus.services";
 import { loadDeclarationAdjustments } from "@/services/tax-declaration.services";
 import { loadRoster, type RosterEntry } from "@/services/roster.services";
 import { calculatePayroll, type CalcLoan, type CalcSettings } from "@/services/payroll-calc";
 import { parseWeeklyOff } from "@/services/payroll-settings.services";
-import { holidayDatesBetween } from "@/services/holiday.services";
+import { holidayDatesBetween, holidaysForBranch } from "@/services/holiday.services";
 import {
   isStatutoryActive,
   loadEmployeeStatutoryMap,
@@ -38,6 +41,7 @@ import {
   loadYearToDate,
 } from "@/services/statutory.services";
 import { fromCents, lockAndMeasure, toCents, totalDueCents } from "@/services/recoverable.services";
+import { autoCreditCompOff, offDayOutcomesBetween } from "@/services/off-day-work.services";
 import { fail, ok, type ServiceResult } from "@/utils/result";
 import type { generatePayrollSchema } from "@/validator/payroll.validator";
 import type { TaxRegime } from "@/drizzle/schema";
@@ -67,6 +71,9 @@ const loadSettings = async (organizationId: string): Promise<CalcSettings & { cu
     autoDeductLoans: s?.autoDeductLoans ?? false,
     paidHolidays: s?.paidHolidays ?? false,
     overtimeApprovalRequired: s?.overtimeApprovalRequired ?? false,
+    offDayWorkPolicy: s?.offDayWorkPolicy ?? "manager",
+    weeklyOffWorkMultiplier: num(s?.weeklyOffWorkMultiplier) ?? 1,
+    holidayWorkMultiplier: num(s?.holidayWorkMultiplier) ?? 2,
   };
 };
 
@@ -134,6 +141,68 @@ export const generateRun = async (
     return fail("conflict", "Payroll for this period is already finalized");
   }
 
+  const { values, skipped } = await buildPayrollItems(organizationId, input, {
+    recoverLoans: true,
+    reimburseClaims: true,
+    payBonuses: true,
+    skipSettledFrom: input.periodStart,
+  });
+
+  const runId = await db.transaction(async (tx) => {
+    let id = existing?.id;
+    if (id) {
+      await tx.delete(items).where(and(eq(items.organizationId, organizationId), eq(items.runId, id)));
+      await tx
+        .update(runs)
+        .set({ utcOffsetMinutes: input.utcOffsetMinutes, generatedByUserId: requesterId, createdAt: new Date() })
+        .where(eq(runs.id, id));
+    } else {
+      const [created] = await tx
+        .insert(runs)
+        .values({
+          organizationId,
+          periodStart: input.periodStart,
+          periodEnd: input.periodEnd,
+          utcOffsetMinutes: input.utcOffsetMinutes,
+          generatedByUserId: requesterId,
+        })
+        .returning({ id: runs.id });
+      id = created.id;
+    }
+    if (values.length > 0) await tx.insert(items).values(values.map((v) => ({ ...v, runId: id! })));
+    return id;
+  });
+
+  const detail = await getRun(organizationId, requesterId, runId);
+  if (!detail.ok) return detail;
+  return ok({ ...detail.data, skipped });
+};
+
+type BuildOptions = {
+  /** Only these employees (membership ids); by default everyone on payroll. */
+  membershipIds?: string[];
+  /** Include employees who are no longer active, for a leaver's final settlement. */
+  includeInactive?: boolean;
+  /** Deduct loan installments; a final settlement recovers loans as its own lines instead. */
+  recoverLoans: boolean;
+  /** Pay approved expense claims; a final settlement reimburses them as its own lines instead. */
+  reimburseClaims: boolean;
+  /** Pay approved bonuses due with payroll, as a taxable earning. */
+  payBonuses?: boolean;
+  /** Leave out employees whose full & final settlement already covers this date. */
+  skipSettledFrom?: string;
+};
+
+/**
+ * Works out each employee's pay for a period: attendance, leave, holidays, roster, overtime, statutory
+ * deductions and, when asked, loan installments and expense reimbursements. Used by payroll runs and
+ * by full & final settlements (for one employee's last days).
+ */
+export const buildPayrollItems = async (
+  organizationId: string,
+  input: z.infer<typeof generatePayrollSchema>,
+  options: BuildOptions,
+) => {
   const settings = await loadSettings(organizationId);
   const employees = await db
     .select({
@@ -149,6 +218,10 @@ export const generateRun = async (
       compensationCurrency: memberships.compensationCurrency,
       salaryComponents: memberships.salaryComponents,
       departmentName: departmentsTable.name,
+      branchId: memberships.branchId,
+      branchName: branchesTable.name,
+      branchPtState: branchesTable.ptState,
+      branchPtFlatAmount: branchesTable.ptFlatAmount,
       shiftStart: shiftsTable.startTime,
       shiftEnd: shiftsTable.endTime,
       shiftBreak: shiftsTable.breakMinutes,
@@ -156,11 +229,13 @@ export const generateRun = async (
     .from(memberships)
     .innerJoin(usersTable, eq(usersTable.id, memberships.userId))
     .leftJoin(departmentsTable, eq(departmentsTable.id, memberships.departmentId))
+    .leftJoin(branchesTable, eq(branchesTable.id, memberships.branchId))
     .leftJoin(shiftsTable, eq(shiftsTable.id, memberships.shiftId))
     .where(
       and(
         eq(memberships.organizationId, organizationId),
-        eq(memberships.isActive, true),
+        options.includeInactive ? undefined : eq(memberships.isActive, true),
+        options.membershipIds ? inArray(memberships.id, options.membershipIds) : undefined,
         or(
           ne(memberships.role, UserRole.SUPER_ADMIN),
           eq(memberships.includeInPayroll, true),
@@ -168,14 +243,36 @@ export const generateRun = async (
       ),
     );
 
+  // Leavers whose full & final settlement already pays these days.
+  const settled = options.skipSettledFrom
+    ? new Set(
+        (
+          await db
+            .select({ membershipId: finalSettlementsTable.userOrganizationId })
+            .from(finalSettlementsTable)
+            .where(
+              and(
+                eq(finalSettlementsTable.organizationId, organizationId),
+                inArray(finalSettlementsTable.status, ["finalized", "paid"]),
+                lte(finalSettlementsTable.salaryFrom, input.periodEnd),
+              ),
+            )
+        ).map((row) => row.membershipId),
+      )
+    : new Set<string>();
+
   const skipped: string[] = [];
   const payable = employees.filter((e) => {
+    if (settled.has(e.id)) {
+      skipped.push(`${e.fname} ${e.lname} (settled in full & final)`);
+      return false;
+    }
     const ready = e.compensationType && e.compensationAmount !== null;
     if (!ready) skipped.push(`${e.fname} ${e.lname}`);
     return ready;
   });
 
-  const [attendance, leaveRows, loanRows, repaidRows, payrollPaid, holidays, claimRows] = await Promise.all([
+  const [attendance, leaveRows, loanRows, repaidRows, payrollPaid, holidays, claimRows, bonusRows] = await Promise.all([
     computeDailyAttendance(organizationId, {
       from: input.periodStart,
       to: input.periodEnd,
@@ -223,6 +320,7 @@ export const generateRun = async (
       ),
     holidayDatesBetween(organizationId, input.periodStart, input.periodEnd),
     loadReimbursableClaims(organizationId, input.periodEnd),
+    options.payBonuses ? loadPayrollBonuses(organizationId) : new Map<string, PayrollBonusLine[]>(),
   ]);
 
   const repaidByLoan = new Map<string, number>();
@@ -262,8 +360,12 @@ export const generateRun = async (
         )
     : [];
 
+  // Days worked on a weekly off or holiday: decided ones are paid or not; undecided ones follow the policy.
+  const offDayOutcomes = await offDayOutcomesBetween(organizationId, input.periodStart, input.periodEnd);
+  const offDayPendingBy = new Map<string, { date: string; days: number }[]>();
+
   const values = payable.map((e) => {
-    const loans: CalcLoan[] = loanRows
+    const loans: CalcLoan[] = (options.recoverLoans ? loanRows : [])
       .filter(
         (l) =>
           l.userOrganizationId === e.id &&
@@ -279,7 +381,7 @@ export const generateRun = async (
         outstandingCents: totalDueCents(l) - (repaidByLoan.get(l.id) ?? 0),
       }));
 
-    const reimbursementLines = claimRows
+    const reimbursementLines = (options.reimburseClaims ? claimRows : [])
       .filter((claim) => claim.userOrganizationId === e.id)
       .map((claim) => ({
         claimId: claim.id,
@@ -287,6 +389,8 @@ export const generateRun = async (
         amount: Number(claim.amount).toFixed(2),
       }));
     const reimbursementCents = reimbursementLines.reduce((sum, line) => sum + toCents(line.amount), 0);
+    const bonusLines = bonusRows.get(e.id) ?? [];
+    const bonusCents = bonusLines.reduce((sum, line) => sum + toCents(line.amount), 0);
 
     const calc = calculatePayroll({
       periodStart: input.periodStart,
@@ -298,20 +402,23 @@ export const generateRun = async (
       shiftExpectedMinutes:        e.shiftStart && e.shiftEnd ? shiftMinutes(e.shiftStart, e.shiftEnd, e.shiftBreak ?? 0) : null,
       settings,
       days: attendance.filter((d) => d.employeeId === e.userId),
-      holidays,
+      holidays: holidaysForBranch(holidays, e.branchId),
       leaves: leaveRows.filter((l) => l.userOrganizationId === e.id),
       loans,
+      bonusCents,
       rosterDays: rosterDaysFor(roster.byMembership.get(e.id)),
+      offDayOutcomes: offDayOutcomes.get(e.id),
       overtimeApprovals: new Map(
         approvalRows.filter((r) => r.userOrganizationId === e.id).map((r) => [r.date, r.minutes]),
       ),
       statutory:
         profileMap && ytdMap
-          ? withDeclaration(statutorySettings, profileMap.get(e.id), ytdMap.get(e.id), declarations?.get(e.id))
+          ? withDeclaration(branchStatutory(statutorySettings, e), profileMap.get(e.id), ytdMap.get(e.id), declarations?.get(e.id))
           : undefined,
     });
 
     const one = (n: number) => n.toFixed(1);
+    if (calc.offDayPending.length) offDayPendingBy.set(e.id, calc.offDayPending);
     return {
       organizationId,
       userId: e.userId,
@@ -320,6 +427,8 @@ export const generateRun = async (
       employeeCode: e.employeeCode,
       jobTitle: e.jobTitle,
       departmentName: e.departmentName,
+      branchId: e.branchId,
+      branchName: e.branchName,
       compensationType: e.compensationType!,
       compensationAmount: Number(e.compensationAmount).toFixed(2),
       currencyCode: e.compensationCurrency ?? settings.currencyCode,
@@ -357,37 +466,23 @@ export const generateRun = async (
       })),
       reimbursements: fromCents(reimbursementCents),
       reimbursementLines,
+      bonus: fromCents(calc.bonusPayCents),
+      bonusLines,
+      offDayDays: one(calc.offDayDays),
+      offDayPay: fromCents(calc.offDayPayCents),
+      offDayPendingDays: one(calc.offDayPending.reduce((sum, day) => sum + day.days, 0)),
     };
   });
 
-  const runId = await db.transaction(async (tx) => {
-    let id = existing?.id;
-    if (id) {
-      await tx.delete(items).where(and(eq(items.organizationId, organizationId), eq(items.runId, id)));
-      await tx
-        .update(runs)
-        .set({ utcOffsetMinutes: input.utcOffsetMinutes, generatedByUserId: requesterId, createdAt: new Date() })
-        .where(eq(runs.id, id));
-    } else {
-      const [created] = await tx
-        .insert(runs)
-        .values({
-          organizationId,
-          periodStart: input.periodStart,
-          periodEnd: input.periodEnd,
-          utcOffsetMinutes: input.utcOffsetMinutes,
-          generatedByUserId: requesterId,
-        })
-        .returning({ id: runs.id });
-      id = created.id;
+  // "Always comp-off": undecided days become comp-off credits now, so nothing is left pending.
+  if (settings.offDayWorkPolicy === "comp_off") {
+    for (const [membershipId, pending] of offDayPendingBy) {
+      if (!(await autoCreditCompOff(organizationId, membershipId, pending))) continue;
+      const item = values.find((value) => value.userOrganizationId === membershipId);
+      if (item) item.offDayPendingDays = "0.0";
     }
-    if (values.length > 0) await tx.insert(items).values(values.map((v) => ({ ...v, runId: id! })));
-    return id;
-  });
-
-  const detail = await getRun(organizationId, requesterId, runId);
-  if (!detail.ok) return detail;
-  return ok({ ...detail.data, skipped });
+  }
+  return { values, skipped };
 };
 
 export const deleteRun = async (organizationId: string, requesterId: string, runId: string) => {
@@ -476,6 +571,10 @@ const finalizeInTransaction = (organizationId: string, requesterId: string, runI
       // Throwing rolls back the loan repayments recorded above as well.
       throw new FinalizeConflict("An expense claim in this payroll was cancelled or paid since it was generated. Regenerate the payroll and try again");
     }
+    const bonusItemIds = rows.flatMap((item) => item.bonusLines.map((line) => line.bonusItemId));
+    if (!(await settleBonusesInPayroll(tx, organizationId, runId, bonusItemIds))) {
+      throw new FinalizeConflict("A bonus in this payroll was paid since it was generated. Regenerate the payroll and try again");
+    }
 
     await tx
       .update(runs)
@@ -543,11 +642,20 @@ export const requestSlipWhatsApp = async (
   if (slip.data.run.status !== "finalized") {
     return fail("conflict", "Salary slip can be sent once the payroll is finalized");
   }
-  if (!slip.data.delivery.whatsapp) {
+  const recipient = await loadSlipDelivery(organizationId, itemId);
+  if (!recipient || recipient.phone.startsWith("g")) {
     return fail("invalid", "This employee has no phone number linked for WhatsApp");
   }
-  await enqueueSalarySlipWhatsApp({ organizationId, itemId, requestedByUserId: requesterId });
-  return ok(null);
+  const queued = await queueDelivery({
+    organizationId,
+    requesterId,
+    channel: "whatsapp",
+    messageType: "salary_slip",
+    relatedId: itemId,
+    recipientUserId: slip.data.item.userId,
+    recipientMasked: maskPhone(recipient.phone),
+  });
+  return queued.ok ? ok(null) : queued;
 };
 
 export const requestSlipEmail = async (
@@ -562,11 +670,20 @@ export const requestSlipEmail = async (
   if (slip.data.run.status !== "finalized") {
     return fail("conflict", "Salary slip can be sent once the payroll is finalized");
   }
-  if (!slip.data.delivery.email) {
+  const recipient = await loadSlipDelivery(organizationId, itemId);
+  if (!recipient?.email) {
     return fail("invalid", "This employee has no Google email linked");
   }
-  await enqueueSalarySlipEmail({ organizationId, itemId, requestedByUserId: requesterId });
-  return ok(null);
+  const queued = await queueDelivery({
+    organizationId,
+    requesterId,
+    channel: "email",
+    messageType: "salary_slip",
+    relatedId: itemId,
+    recipientUserId: slip.data.item.userId,
+    recipientMasked: maskEmail(recipient.email),
+  });
+  return queued.ok ? ok(null) : queued;
 };
 
 /** Slip data and recipient for the WhatsApp worker. No access check; the producer already authorized. */
@@ -606,7 +723,7 @@ export const loadSlipDelivery = async (organizationId: string, itemId: string) =
 export const getSlip = async (organizationId: string, requesterId: string, itemId: string) => {
   const access = await requireRole(organizationId, requesterId, ALL_ROLES);
   if (!access.ok) return access;
-  const isManager = MANAGER_ROLES.includes(access.data.role);
+  const isManager = isOrganizationManager(access.data);
 
   const [row] = await db
     .select({
@@ -628,7 +745,7 @@ export const getSlip = async (organizationId: string, requesterId: string, itemI
     return fail("not-found", "Salary slip not found");
   }
   const { phone, email, emailVerified, ...slip } = row;
-  return ok({ ...slip, delivery: deliveryChannels({ phone, email, emailVerified }) });
+  return ok({ ...slip, delivery: await sendableChannels(organizationId, "salary_slip", deliveryChannels({ phone, email, emailVerified })) });
 };
 
 /**
@@ -650,10 +767,23 @@ const withDeclaration = (
     : { settings, employee, ytd };
 
 /** Work or off for each date that comes from a rotation or an override; default-shift dates are left out. */
-const rosterDaysFor = (days: Map<string, RosterEntry> | undefined) => {
+export const rosterDaysFor = (days: Map<string, RosterEntry> | undefined) => {
   const result = new Map<string, "work" | "off">();
   for (const [date, entry] of days ?? []) {
     if (entry.source !== "default") result.set(date, entry.shiftId ? "work" : "off");
   }
   return result;
 };
+
+/** A branch with its own professional tax state uses that state's slabs instead of the organization's. */
+const branchStatutory = (
+  settings: StatutorySettings,
+  employee: { branchPtState: string | null; branchPtFlatAmount: string | null },
+): StatutorySettings =>
+  settings.ptEnabled && employee.branchPtState
+    ? {
+        ...settings,
+        ptState: employee.branchPtState,
+        ptFlatAmount: employee.branchPtFlatAmount === null ? null : Number(employee.branchPtFlatAmount),
+      }
+    : settings;

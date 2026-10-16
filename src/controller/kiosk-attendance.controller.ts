@@ -2,23 +2,36 @@ import type { Context } from "hono";
 
 import {
   getDailyAttendance,
+  getGpsStatus,
+  recordGpsAttendance,
   listAttendance,
   recordBulkManualAttendance,
   recordKioskAttendance,
   recordManualAttendance,
 } from "@/services/attendance.services";
 import {
+  claimPairingCode,
   createKiosk,
+  createKioskCode,
+  unlockEnrollment,
+  unpairKiosk,
   listKiosks,
   rotateKioskKey,
   updateKiosk,
 } from "@/services/kiosk.services";
+import { clientIp } from "@/middleware/audit.middleware";
 import { withBody, withOrganization, withParam, withQuery } from "@/utils/controller";
+import { incrementWithExpiry } from "@/utils/redis";
+import { sendResponse } from "@/utils/response";
 import { respond, ok } from "@/utils/result";
 import {
   bulkManualAttendanceSchema,
+  claimPairingCodeSchema,
   createKioskSchema,
+  dailyAttendancePageQuerySchema,
   dailyAttendanceQuerySchema,
+  gpsAttendanceSchema,
+  gpsStatusQuerySchema,
   kioskAttendanceSchema,
   listAttendanceQuerySchema,
   manualAttendanceSchema,
@@ -48,6 +61,48 @@ export const rotateKioskKeyController = withOrganization((c, { organizationId, u
     respond(c, await rotateKioskKey(organizationId, userId, id), "Kiosk key rotated"),
   ),
 );
+
+export const createPairingCodeController = withOrganization((c, { organizationId, userId }) =>
+  withParam(c, "kioskId", async (id) =>
+    respond(c, await createKioskCode(organizationId, userId, id, "pair"), "Pairing code created", 201),
+  ),
+);
+
+export const unpairKioskController = withOrganization((c, { organizationId, userId }) =>
+  withParam(c, "kioskId", async (id) =>
+    respond(c, await unpairKiosk(organizationId, userId, id), "Kiosk unpaired"),
+  ),
+);
+
+export const createEnrollmentCodeController = withOrganization((c, { organizationId, userId }) =>
+  withParam(c, "kioskId", async (id) =>
+    respond(c, await createKioskCode(organizationId, userId, id, "enroll"), "Enrollment code created", 201),
+  ),
+);
+
+export const unlockEnrollmentController = async (c: Context) => {
+  const kiosk = c.get("kiosk");
+  const attempts = await incrementWithExpiry(`kiosk-enroll-attempts:${kiosk.id}`, 900);
+  if (attempts > MAX_PAIRING_ATTEMPTS) {
+    return sendResponse(c, "error", "Too many attempts. Try again in 15 minutes.", null, 429);
+  }
+  return withBody(c, claimPairingCodeSchema, async ({ code }) =>
+    respond(c, await unlockEnrollment(kiosk, code), "Enrollment unlocked"),
+  );
+};
+
+const MAX_PAIRING_ATTEMPTS = 10;
+
+export const claimPairingCodeController = async (c: Context) => {
+  // Unauthenticated and only 10^6 codes, so cap guesses per address.
+  const attempts = await incrementWithExpiry(`kiosk-pair-attempts:${clientIp(c) ?? "unknown"}`, 900);
+  if (attempts > MAX_PAIRING_ATTEMPTS) {
+    return sendResponse(c, "error", "Too many attempts. Try again in 15 minutes.", null, 429);
+  }
+  return withBody(c, claimPairingCodeSchema, async ({ code }) =>
+    respond(c, await claimPairingCode(code), "Kiosk paired"),
+  );
+};
 
 export const kioskHeartbeatController = async (c: Context) => {
   const offset = Number(c.req.query("utcOffsetMinutes") ?? 0);
@@ -106,8 +161,29 @@ export const dailyAttendanceController = withOrganization((c, { organizationId, 
   ),
 );
 
+export const dailyAttendancePageController = withOrganization((c, { organizationId, userId }) =>
+  withQuery(c, dailyAttendancePageQuerySchema, async ({ status, limit, offset, ...query }) => {
+    const result = await getDailyAttendance(organizationId, userId, query);
+    if (!result.ok) return respond(c, result, "");
+    const rows = status ? result.data.filter((day) => day.status === status) : result.data;
+    return respond(c, ok({ rows: rows.slice(offset, offset + limit), total: rows.length }), "Daily attendance fetched");
+  }),
+);
+
 export const listAttendanceController = withOrganization((c, { organizationId, userId }) =>
   withQuery(c, listAttendanceQuerySchema, async (query) =>
     respond(c, await listAttendance(organizationId, userId, query), "Attendance fetched"),
+  ),
+);
+
+export const gpsStatusController = withOrganization((c, { organizationId, userId }) =>
+  withQuery(c, gpsStatusQuerySchema, async (query) =>
+    respond(c, await getGpsStatus(organizationId, userId, query.utcOffsetMinutes), "GPS check-in status fetched"),
+  ),
+);
+
+export const gpsAttendanceController = withOrganization((c, { organizationId, userId }) =>
+  withBody(c, gpsAttendanceSchema, async (body) =>
+    respond(c, await recordGpsAttendance(organizationId, userId, body), body.eventType === "check_in" ? "Checked in" : "Checked out", 201),
   ),
 );

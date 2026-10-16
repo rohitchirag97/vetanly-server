@@ -76,9 +76,17 @@ export const buildSalarySlipPdf = ({ item: i, run, organizationName }: SlipData)
     pair("Basic pay", m(i.basePay));
     doc.moveDown(0.3);
     pair("Overtime", m(i.overtimePay));
+    if (Number(i.offDayPay) > 0) {
+      doc.moveDown(0.3);
+      pair(`Off-day work (${Number(i.offDayDays)} day${Number(i.offDayDays) === 1 ? "" : "s"})`, m(i.offDayPay));
+    }
     for (const line of i.componentLines.filter((l) => l.kind === "earning")) {
       doc.moveDown(0.3);
       pair(line.name, m(line.amount));
+    }
+    for (const line of i.bonusLines) {
+      doc.moveDown(0.3);
+      pair(line.label, m(line.amount));
     }
     doc.moveDown(0.3);
     pair("Gross pay", m(i.grossPay), true);

@@ -9,9 +9,10 @@ bun run dev
 ```
 
 This starts both the API and its background workers for local development.
-Copy `.env.example` to `.env` and fill it in, then start Postgres and Redis with
-`docker compose up -d`. Compose and the app read the same `POSTGRES_*` and
-`REDIS_*` values from `.env`, so they always agree.
+Copy `.env.example` to `.env` and fill it in, then start Postgres and Redis from the
+repository root with `docker compose up -d database redis`. Compose and the app read the
+same `POSTGRES_*` and `REDIS_*` values from this `.env`, so they always agree. The root
+`docker-compose.yml` can also build and run the whole stack (API, dashboard, marketing site).
 
 The OTP worker currently prints a development OTP to the console. Configure an
 SMS provider before using OTP delivery in production; the worker fails those

@@ -3,6 +3,7 @@ import type { z } from "zod";
 
 import db from "@/utils/db";
 import {
+  branchesTable,
   departmentsTable,
   shiftsTable,
   userOrganizationsTable,
@@ -10,6 +11,7 @@ import {
 } from "@/drizzle/schema";
 import {
   ALL_ROLES,
+  canManageMember,
   getEmployeeMembership,
   OWNER_ROLES,
   PEOPLE_MANAGER_ROLES,
@@ -32,6 +34,8 @@ const selectEmployment = async (organizationId: string, employeeId: string) => {
       departmentName: departmentsTable.name,
       shiftId: userOrganizationsTable.shiftId,
       shiftName: shiftsTable.name,
+      branchId: userOrganizationsTable.branchId,
+      branchName: branchesTable.name,
       employmentType: userOrganizationsTable.employmentType,
       hireDate: userOrganizationsTable.hireDate,
       compensationType: userOrganizationsTable.compensationType,
@@ -46,6 +50,7 @@ const selectEmployment = async (organizationId: string, employeeId: string) => {
       eq(departmentsTable.id, userOrganizationsTable.departmentId),
     )
     .leftJoin(shiftsTable, eq(shiftsTable.id, userOrganizationsTable.shiftId))
+    .leftJoin(branchesTable, eq(branchesTable.id, userOrganizationsTable.branchId))
     .where(
       and(
         eq(userOrganizationsTable.organizationId, organizationId),
@@ -70,13 +75,7 @@ export const getEmployment = async (
   }
   const membership = await getEmployeeMembership(organizationId, employeeId);
   if (!membership) return fail("not-found", "Employee not found in this organization");
-  if (
-    access.data.role === UserRole.HR &&
-    employeeId !== requesterId &&
-    membership.role !== UserRole.EMPLOYEE
-  ) {
-    return fail("forbidden");
-  }
+  if (employeeId !== requesterId && !canManageMember(access.data, membership)) return fail("forbidden");
   const employment = await selectEmployment(organizationId, employeeId);
   return employment ? ok(employment) : fail("not-found", "Employee not found in this organization");
 };
@@ -98,9 +97,22 @@ export const updateEmployment = async (
   ) {
     return fail("forbidden", "Only the organization owner can change owner details");
   }
-  if (access.data.role === UserRole.HR && target.role !== UserRole.EMPLOYEE) {
-    return fail("forbidden");
+  if (!canManageMember(access.data, target)) return fail("forbidden");
+
+  if (input.branchId) {
+    // A branch admin can move people only between their own branches.
+    if (access.data.branchIds && !access.data.branchIds.includes(input.branchId)) {
+      return fail("forbidden", "You can only assign your own branches");
+    }
+    const [branch] = await db
+      .select({ id: branchesTable.id })
+      .from(branchesTable)
+      .where(and(eq(branchesTable.id, input.branchId), eq(branchesTable.organizationId, organizationId), eq(branchesTable.isActive, true)))
+      .limit(1);
+    if (!branch) return fail("invalid", "Branch not found or inactive");
   }
+  // A branch admin cannot take someone out of their branches; an empty branch leaves it as it is.
+  const changes = input.branchId === null && access.data.branchIds ? { ...input, branchId: undefined } : input;
 
   if (input.departmentId) {
     const [department] = await db
@@ -132,20 +144,18 @@ export const updateEmployment = async (
     if (!shift) return fail("invalid", "Shift not found or inactive");
   }
 
-  const { compensationAmount, ...rest } = input;
+  const { compensationAmount, ...rest } = changes;
+  const values = {
+    ...rest,
+    ...(compensationAmount === undefined
+      ? {}
+      : { compensationAmount: compensationAmount === null ? null : compensationAmount.toFixed(2) }),
+  };
   try {
-    await db
-      .update(userOrganizationsTable)
-      .set({
-        ...rest,
-        ...(compensationAmount === undefined
-          ? {}
-          : {
-              compensationAmount:
-                compensationAmount === null ? null : compensationAmount.toFixed(2),
-            }),
-      })
-      .where(eq(userOrganizationsTable.id, target.id));
+    // Nothing left to change when the only field was a branch the requester may not clear.
+    if (Object.values(values).some((value) => value !== undefined)) {
+      await db.update(userOrganizationsTable).set(values).where(eq(userOrganizationsTable.id, target.id));
+    }
   } catch (error) {
     if (isUniqueViolation(error)) {
       return fail("conflict", "This employee code is already used in the organization");

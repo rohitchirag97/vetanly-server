@@ -3,6 +3,7 @@ import type { z } from "zod";
 
 import db from "@/utils/db";
 import {
+  leaveCreditsTable as credits,
   leaveRequestsTable as requests,
   leaveTypesTable as types,
   userOrganizationsTable,
@@ -12,10 +13,13 @@ import {
 } from "@/drizzle/schema";
 import {
   ALL_ROLES,
+  branchFilter,
+  canManageMember,
   getEmployeeMembership,
   PEOPLE_MANAGER_ROLES,
   requireRole,
 } from "@/services/access.services";
+import { carriedInto, compOffAvailable } from "@/services/leave-balance";
 import { peopleManagerIds, notify } from "@/services/notification.services";
 import { fail, isUniqueViolation, ok, type ServiceResult } from "@/utils/result";
 import type {
@@ -31,8 +35,36 @@ const typeColumns = {
   name: types.name,
   isPaid: types.isPaid,
   annualAllowanceDays: types.annualAllowanceDays,
+  carryForwardMaxDays: types.carryForwardMaxDays,
+  isCompOff: types.isCompOff,
+  compOffValidityDays: types.compOffValidityDays,
   isActive: types.isActive,
+  createdAt: types.createdAt,
 };
+
+type LeaveTypeRow = {
+  id: string;
+  annualAllowanceDays: string | null;
+  carryForwardMaxDays: string | null;
+  isCompOff: boolean;
+  compOffValidityDays: number | null;
+  createdAt: Date;
+};
+
+// A comp-off type has no yearly allowance or carry-forward: its days come only from credits.
+const typeRules = (input: { isCompOff?: boolean; annualAllowanceDays?: number | null; carryForwardMaxDays?: number | null }) =>
+  input.isCompOff
+    ? { annualAllowanceDays: null, carryForwardMaxDays: null }
+    : {
+        annualAllowanceDays:
+          input.annualAllowanceDays === undefined || input.annualAllowanceDays === null
+            ? input.annualAllowanceDays
+            : input.annualAllowanceDays.toFixed(1),
+        carryForwardMaxDays:
+          input.carryForwardMaxDays === undefined || input.carryForwardMaxDays === null
+            ? input.carryForwardMaxDays
+            : input.carryForwardMaxDays.toFixed(1),
+      };
 
 const transitions: Record<string, LeaveStatus[]> = {
   pending: ["approved", "rejected", "cancelled"],
@@ -79,7 +111,9 @@ export const createLeaveType = async (
         organizationId,
         name: input.name,
         isPaid: input.isPaid,
-        annualAllowanceDays: input.annualAllowanceDays?.toFixed(1),
+        isCompOff: input.isCompOff,
+        compOffValidityDays: input.isCompOff ? input.compOffValidityDays : null,
+        ...typeRules(input),
       })
       .returning(typeColumns);
     return ok(created);
@@ -100,13 +134,7 @@ export const updateLeaveType = async (
   try {
     const [updated] = await db
       .update(types)
-      .set({
-        ...input,
-        annualAllowanceDays:
-          input.annualAllowanceDays === undefined || input.annualAllowanceDays === null
-            ? input.annualAllowanceDays
-            : input.annualAllowanceDays.toFixed(1),
-      })
+      .set({ ...input, ...typeRules(input) })
       .where(and(eq(types.id, typeId), eq(types.organizationId, organizationId)))
       .returning(typeColumns);
     return updated ? ok(updated) : fail("not-found", "Leave type not found");
@@ -122,6 +150,7 @@ const selectRequests = (where: SQL | undefined) =>
       id: requests.id,
       employeeId: userOrganizationsTable.userId,
       employeeRole: userOrganizationsTable.role,
+      employeeBranchId: userOrganizationsTable.branchId,
       fname: usersTable.fname,
       lname: usersTable.lname,
       leaveTypeId: requests.leaveTypeId,
@@ -162,20 +191,71 @@ const loadOne = async (organizationId: string, id: string) => {
   return row ? toRequest(row) : null;
 };
 
-const usedDays = async (userOrganizationId: string, leaveTypeId: string, year: number) => {
-  const rows = await db
-    .select({ days: requests.days })
-    .from(requests)
-    .where(
-      and(
-        eq(requests.userOrganizationId, userOrganizationId),
-        eq(requests.leaveTypeId, leaveTypeId),
-        inArray(requests.status, ["pending", "approved"]),
-        gte(requests.startDate, `${year}-01-01`),
-        lte(requests.startDate, `${year}-12-31`),
+const sumByYear = (rows: { date: string; days: string }[]) => {
+  const byYear = new Map<number, number>();
+  for (const row of rows) {
+    const year = Number(row.date.slice(0, 4));
+    byYear.set(year, (byYear.get(year) ?? 0) + Number(row.days));
+  }
+  return byYear;
+};
+
+/**
+ * One employee's balance of one leave type as of a date (see leave-balance.ts). Pending requests
+ * count as used so two open requests cannot spend the same days.
+ */
+export const leaveTypeBalance = async (membershipId: string, type: LeaveTypeRow, asOf: string) => {
+  const [taken, granted, [member]] = await Promise.all([
+    db
+      .select({ date: requests.startDate, days: requests.days })
+      .from(requests)
+      .where(
+        and(
+          eq(requests.userOrganizationId, membershipId),
+          eq(requests.leaveTypeId, type.id),
+          inArray(requests.status, ["pending", "approved"]),
+        ),
       ),
-    );
-  return rows.reduce((sum, row) => sum + Number(row.days), 0);
+    db
+      .select({ date: credits.workedOn, days: credits.days })
+      .from(credits)
+      .where(and(eq(credits.userOrganizationId, membershipId), eq(credits.leaveTypeId, type.id))),
+    db
+      .select({ hireDate: userOrganizationsTable.hireDate })
+      .from(userOrganizationsTable)
+      .where(eq(userOrganizationsTable.id, membershipId))
+      .limit(1),
+  ]);
+  const year = Number(asOf.slice(0, 4));
+  const usedByYear = sumByYear(taken);
+  const creditsByYear = sumByYear(granted);
+  const used = usedByYear.get(year) ?? 0;
+  const credited = creditsByYear.get(year) ?? 0;
+
+  if (type.isCompOff) {
+    const remaining = compOffAvailable({
+      credits: granted.map((row) => ({ workedOn: row.date, days: Number(row.days) })),
+      taken: taken.map((row) => ({ startDate: row.date, days: Number(row.days) })),
+      asOf,
+      validityDays: type.compOffValidityDays,
+    });
+    return { allowance: null, carried: 0, credited, used, remaining };
+  }
+  if (type.annualAllowanceDays === null) return { allowance: null, carried: 0, credited, used, remaining: null };
+
+  const allowance = Number(type.annualAllowanceDays);
+  // Carrying starts from the later of the year they joined and the year the leave type was created.
+  const joinedYear = member?.hireDate ? Number(member.hireDate.slice(0, 4)) : 0;
+  const firstYear = Math.max(type.createdAt.getUTCFullYear(), joinedYear);
+  const carried = carriedInto({
+    year,
+    firstYear,
+    allowance,
+    cap: type.carryForwardMaxDays === null ? null : Number(type.carryForwardMaxDays),
+    usedByYear,
+    creditsByYear,
+  });
+  return { allowance, carried, credited, used, remaining: Math.max(0, allowance + carried + credited - used) };
 };
 
 export const createLeaveRequest = async (
@@ -195,11 +275,7 @@ export const createLeaveRequest = async (
   if (!membership || !membership.isActive) {
     return fail("not-found", "Employee not found in this organization");
   }
-  if (
-    access.data.role === UserRole.HR &&
-    membership.role !== UserRole.EMPLOYEE &&
-    employeeId !== requesterId
-  ) {
+  if (employeeId !== requesterId && !canManageMember(access.data, membership)) {
     return fail("forbidden");
   }
 
@@ -231,11 +307,14 @@ export const createLeaveRequest = async (
   if (overlap) return fail("conflict", "You already have leave in this date range");
 
   const days = countDays(input.startDate, input.endDate, input.isHalfDay);
-  if (type.annualAllowanceDays !== null) {
-    const used = await usedDays(membership.id, type.id, Number(input.startDate.slice(0, 4)));
-    if (used + days > Number(type.annualAllowanceDays)) {
-      return fail("invalid", "This request exceeds the annual allowance for this leave type");
-    }
+  const balance = await leaveTypeBalance(membership.id, type, input.startDate);
+  if (balance.remaining !== null && days > balance.remaining) {
+    return fail(
+      "invalid",
+      type.isCompOff
+        ? `Only ${balance.remaining} comp-off day(s) are available on that date`
+        : `This request exceeds the ${balance.remaining} day(s) left of this leave type this year`,
+    );
   }
 
   const [created] = await db
@@ -302,6 +381,8 @@ export const listLeaveRequests = async (
       ),
     );
   }
+  const branchIds = isManager && employeeId !== requesterId ? branchFilter(access.data, query.branchId) : undefined;
+  if (branchIds) conditions.push(inArray(userOrganizationsTable.branchId, branchIds));
   if (query.status) conditions.push(eq(requests.status, query.status));
 
   const rows = await selectRequests(and(...conditions)).orderBy(desc(requests.createdAt));
@@ -326,9 +407,9 @@ export const updateLeaveStatus = async (
     input.status === "cancelled" && current.status === "pending" && isOwn;
 
   if (
-    access.data.role === UserRole.HR &&
-    current.employeeRole !== UserRole.EMPLOYEE &&
-    !isOwnPendingCancel
+    isManager &&
+    !isOwnPendingCancel &&
+    !canManageMember(access.data, { role: current.employeeRole, branchId: current.employeeBranchId })
   ) {
     return fail("forbidden");
   }
@@ -407,17 +488,36 @@ export const getLeaveBalances = async (
     .from(types)
     .where(and(eq(types.organizationId, organizationId), eq(types.isActive, true)))
     .orderBy(types.name);
+  const today = new Date().toISOString().slice(0, 10);
+  // Comp-off is counted as of today (credits expire); yearly types as of the year asked for.
+  const asOfFor = (isCompOff: boolean) => (isCompOff || today.startsWith(String(year)) ? today : `${year}-12-31`);
   const balances = [];
   for (const type of activeTypes) {
-    const used = await usedDays(access.data.id, type.id, year);
-    const allowance = type.annualAllowanceDays === null ? null : Number(type.annualAllowanceDays);
+    const balance = await leaveTypeBalance(access.data.id, type, asOfFor(type.isCompOff));
     balances.push({
       leaveTypeId: type.id,
       name: type.name,
-      allowanceDays: allowance,
-      usedDays: used,
-      remainingDays: allowance === null ? null : Math.max(allowance - used, 0),
+      isCompOff: type.isCompOff,
+      allowanceDays: balance.allowance,
+      carriedForwardDays: balance.carried,
+      creditedDays: balance.credited,
+      usedDays: balance.used,
+      remainingDays: balance.remaining,
     });
   }
   return ok(balances);
+};
+
+/** Unused paid leave on the last working day (carried-forward and comp-off days included), for encashment in a final settlement. */
+export const remainingPaidLeave = async (organizationId: string, membershipId: string, asOf: string) => {
+  const paidTypes = await db
+    .select(typeColumns)
+    .from(types)
+    .where(and(eq(types.organizationId, organizationId), eq(types.isActive, true), eq(types.isPaid, true)));
+  const result: { name: string; remainingDays: number }[] = [];
+  for (const type of paidTypes) {
+    const { remaining } = await leaveTypeBalance(membershipId, type, asOf);
+    if (remaining !== null) result.push({ name: type.name, remainingDays: remaining });
+  }
+  return result;
 };

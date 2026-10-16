@@ -54,7 +54,7 @@ const loadAsOwner = async (
     .limit(1);
   if (!row || row.status === "deleted") return fail("forbidden", "Only the organization owner can do this");
   if (row.status === "suspended") {
-    return fail("conflict", "This organization is suspended by HazriPro. Contact support to make changes.");
+    return fail("conflict", "This organization is suspended by Vetanly. Contact support to make changes.");
   }
   return ok(row);
 };
@@ -128,6 +128,19 @@ const PURGE_ORDER = [
   "employee_statutory_profiles",
   "leave_types",
   "kiosk_devices",
+  "wallet_top_up_requests",
+  "wallet_transactions",
+  "message_logs",
+  "messaging_templates",
+  "messaging_providers",
+  "messaging_settings",
+  "asset_assignments",
+  "assets",
+  "accounting_exports",
+  "accounting_settings",
+  "bonus_items",
+  "bonus_runs",
+  "final_settlements",
   "shift_swap_requests",
   "shift_roster_overrides",
   "shift_rotation_assignments",
@@ -145,7 +158,9 @@ const PURGE_ORDER = [
   "holidays",
   "announcements",
   "notifications",
+  "branch_managers",
   "user_organizations",
+  "branches",
   "departments",
   "shifts",
   "audit_logs",
@@ -188,7 +203,7 @@ export const purgeOrganization = async (organizationId: string) => {
     if (!org) return "skipped" as const;
 
     // Lets the audit-log guard accept deletes for this organization only, until the transaction ends.
-    await tx.execute(sql`select set_config('hazripro.purge_organization_id', ${organizationId}, true)`);
+    await tx.execute(sql`select set_config('vetanly.purge_organization_id', ${organizationId}, true)`);
     for (const table of PURGE_ORDER) {
       await tx.execute(sql`delete from ${sql.identifier(table)} where organization_id = ${organizationId}`);
     }

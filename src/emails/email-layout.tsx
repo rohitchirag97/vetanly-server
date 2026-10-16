@@ -27,13 +27,13 @@ export const EmailLayout = ({
     <Body style={styles.body}>
       <Container style={styles.container}>
         <Section style={styles.header}>
-          <Text style={styles.brand}>HazriPro</Text>
+          <Text style={styles.brand}>Vetanly</Text>
           <Text style={styles.organization}>{organizationName}</Text>
         </Section>
         <Section style={styles.content}>{children}</Section>
         <Hr style={{ borderColor: "#e4e4e7", margin: "16px 32px" }} />
         <Text style={styles.footer}>
-          The document is attached as a PDF. This email was sent by HazriPro on behalf of {organizationName}.
+          The document is attached as a PDF. This email was sent by Vetanly on behalf of {organizationName}.
           If you did not expect it, contact your HR team.
         </Text>
       </Container>

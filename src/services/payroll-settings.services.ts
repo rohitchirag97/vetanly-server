@@ -5,6 +5,7 @@ import db from "@/utils/db";
 import {
   organizationPayrollSettingsTable,
   type LateFineMethod,
+  type OffDayWorkPolicy,
   type OvertimeCalculationMethod,
 } from "@/drizzle/schema";
 import { MANAGER_ROLES, OWNER_ROLES, requireRole } from "@/services/access.services";
@@ -25,6 +26,9 @@ type PayrollSettings = {
   autoDeductLoans: boolean;
   paidHolidays: boolean;
   overtimeApprovalRequired: boolean;
+  offDayWorkPolicy: OffDayWorkPolicy;
+  weeklyOffWorkMultiplier: string;
+  holidayWorkMultiplier: string;
   fullDayThresholdPercent: string;
   halfDayThresholdPercent: string;
   updatedAt: Date;
@@ -60,6 +64,9 @@ const columns = {
   autoDeductLoans: organizationPayrollSettingsTable.autoDeductLoans,
   paidHolidays: organizationPayrollSettingsTable.paidHolidays,
   overtimeApprovalRequired: organizationPayrollSettingsTable.overtimeApprovalRequired,
+  offDayWorkPolicy: organizationPayrollSettingsTable.offDayWorkPolicy,
+  weeklyOffWorkMultiplier: organizationPayrollSettingsTable.weeklyOffWorkMultiplier,
+  holidayWorkMultiplier: organizationPayrollSettingsTable.holidayWorkMultiplier,
   fullDayThresholdPercent: organizationPayrollSettingsTable.fullDayThresholdPercent,
   halfDayThresholdPercent: organizationPayrollSettingsTable.halfDayThresholdPercent,
   updatedAt: organizationPayrollSettingsTable.updatedAt,
@@ -105,6 +112,9 @@ export const savePayrollSettings = async (
     autoDeductLoans: input.autoDeductLoans,
     paidHolidays: input.paidHolidays,
     overtimeApprovalRequired: input.overtimeApprovalRequired,
+    offDayWorkPolicy: input.offDayWorkPolicy,
+    weeklyOffWorkMultiplier: input.weeklyOffWorkMultiplier.toFixed(2),
+    holidayWorkMultiplier: input.holidayWorkMultiplier.toFixed(2),
     fullDayThresholdPercent: input.fullDayThresholdPercent.toFixed(2),
     halfDayThresholdPercent: input.halfDayThresholdPercent.toFixed(2),
     updatedAt: new Date(),

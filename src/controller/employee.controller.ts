@@ -110,6 +110,15 @@ const respondToMembershipAction = (
   if (result.status === "employee-not-found") {
     return sendResponse(c, "error", "Employee not found in this organization", null, 404);
   }
+  if (result.status === "holds-assets") {
+    return sendResponse(
+      c,
+      "error",
+      `This person still holds ${"count" in result ? result.count : "some"} company asset(s). Take them back on the Assets page first, or deactivate them instead.`,
+      null,
+      409,
+    );
+  }
   if (result.status === "cannot-remove-super-admin") {
     return sendResponse(
       c,
@@ -238,7 +247,7 @@ export const bulkCreateEmployeesController = async (c: Context): Promise<Respons
     );
   }
 
-  const { organizationId, employees } = parsed.data;
+  const { organizationId, employees, branchId } = parsed.data;
   const billing = await requireFullAccess(organizationId);
   if (!billing.ok) return respond(c, billing, "");
   const seenPhones = new Set<string>();
@@ -252,7 +261,7 @@ export const bulkCreateEmployeesController = async (c: Context): Promise<Respons
     }
     seenPhones.add(employee.phone);
     try {
-      const result = await createEmployeeForOrganization({ ...employee, organizationId }, user.id);
+      const result = await createEmployeeForOrganization({ ...employee, organizationId, branchId }, user.id);
       if (result.status === "organization-not-found") {
         return sendResponse(c, "error", "Organization not found", null, 404);
       }

@@ -2,7 +2,7 @@ import { and, eq } from "drizzle-orm";
 import type { z } from "zod";
 
 import db from "@/utils/db";
-import { employeeProfilesTable } from "@/drizzle/schema";
+import { employeeProfilesTable, employeeStatutoryProfilesTable } from "@/drizzle/schema";
 import { authorizeEmployeeRecord } from "@/services/access.services";
 import { ok, type ServiceResult } from "@/utils/result";
 import { decryptSecret, encryptSecret, maskAccountNumber } from "@/utils/crypto";
@@ -10,6 +10,7 @@ import type { profileSchema } from "@/validator/employee-record.validator";
 
 const columns = {
   dateOfBirth: employeeProfilesTable.dateOfBirth,
+  bloodGroup: employeeProfilesTable.bloodGroup,
   addressLine1: employeeProfilesTable.addressLine1,
   addressLine2: employeeProfilesTable.addressLine2,
   city: employeeProfilesTable.city,
@@ -27,10 +28,20 @@ const columns = {
   updatedAt: employeeProfilesTable.updatedAt,
 };
 
-export type EmployeeProfile = Record<keyof typeof columns, string | Date | null>;
+export type EmployeeProfile = Record<keyof typeof columns | "gender", string | Date | null>;
 
 const empty = (): EmployeeProfile =>
-  Object.fromEntries(Object.keys(columns).map((key) => [key, null])) as EmployeeProfile;
+  Object.fromEntries([...Object.keys(columns), "gender"].map((key) => [key, null])) as EmployeeProfile;
+
+/** Gender lives on the statutory profile, where professional tax slabs read it. */
+const genderOf = async (membershipId: string) => {
+  const [row] = await db
+    .select({ gender: employeeStatutoryProfilesTable.gender })
+    .from(employeeStatutoryProfilesTable)
+    .where(eq(employeeStatutoryProfilesTable.userOrganizationId, membershipId))
+    .limit(1);
+  return row?.gender ?? null;
+};
 
 const withMask = (profile: EmployeeProfile): EmployeeProfile => ({
   ...profile,
@@ -70,7 +81,8 @@ export const getEmployeeProfile = async (
       ),
     )
     .limit(1);
-  return ok(profile ? withMask(profile) : empty());
+  const gender = await genderOf(access.data.target.id);
+  return ok({ ...(profile ? withMask({ ...profile, gender }) : empty()), gender });
 };
 
 export const saveEmployeeProfile = async (
@@ -82,7 +94,13 @@ export const saveEmployeeProfile = async (
   const access = await authorizeEmployeeRecord(organizationId, requesterId, employeeId, true);
   if (!access.ok) return access;
 
-  const { bankAccountNumber, ...rest } = input;
+  const { bankAccountNumber, gender, ...rest } = input;
+  if (gender !== undefined) {
+    await db
+      .insert(employeeStatutoryProfilesTable)
+      .values({ organizationId, userOrganizationId: access.data.target.id, gender, updatedAt: new Date() })
+      .onConflictDoUpdate({ target: employeeStatutoryProfilesTable.userOrganizationId, set: { gender, updatedAt: new Date() } });
+  }
   const values = {
     ...rest,
     ...(bankAccountNumber === undefined
@@ -102,5 +120,5 @@ export const saveEmployeeProfile = async (
       set: values,
     })
     .returning(columns);
-  return ok(withMask(profile));
+  return ok(withMask({ ...profile!, gender: await genderOf(access.data.target.id) }));
 };

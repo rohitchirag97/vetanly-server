@@ -19,10 +19,12 @@ import {
 } from "@/drizzle/schema";
 import {
   ALL_ROLES,
+  canManageMember,
   getEmployeeMembership,
   MANAGER_ROLES,
   PEOPLE_MANAGER_ROLES,
   requireRole,
+  type ActiveMembership,
 } from "@/services/access.services";
 import { detectType, MAX_DOCUMENT_BYTES } from "@/services/employee-document.services";
 import { managerIds, notify, peopleManagerIds } from "@/services/notification.services";
@@ -324,7 +326,7 @@ const loadOwnOpenItem = async (organizationId: string, requesterId: string, item
       declarationId: declarations.id,
       membershipId: memberships.id,
       employeeId: memberships.userId,
-      employeeRole: memberships.role,
+      employeeRole: memberships.role, employeeBranchId: memberships.branchId,
     })
     .from(items)
     .innerJoin(declarations, eq(declarations.id, items.declarationId))
@@ -434,20 +436,20 @@ export const uploadItemProof = async (organizationId: string, requesterId: strin
 };
 
 /** Who may see or review a declaration: its owner, owners and admins, and HR for employees. */
-const reviewerCanSee = (role: string, employeeRole: string) =>
-  MANAGER_ROLES.includes(role) || (role === UserRole.HR && employeeRole === UserRole.EMPLOYEE);
+const reviewerCanSee = (manager: ActiveMembership, employeeRole: string, employeeBranchId: string | null) =>
+  PEOPLE_MANAGER_ROLES.includes(manager.role) && canManageMember(manager, { role: employeeRole, branchId: employeeBranchId });
 
 export const getProofUrl = async (organizationId: string, requesterId: string, itemId: string) => {
   const access = await requireRole(organizationId, requesterId, ALL_ROLES);
   if (!access.ok) return access;
   const [row] = await db
-    .select({ key: items.proofStorageKey, name: items.proofName, employeeId: memberships.userId, employeeRole: memberships.role })
+    .select({ key: items.proofStorageKey, name: items.proofName, employeeId: memberships.userId, employeeRole: memberships.role, employeeBranchId: memberships.branchId })
     .from(items)
     .innerJoin(declarations, eq(declarations.id, items.declarationId))
     .innerJoin(memberships, eq(memberships.id, declarations.userOrganizationId))
     .where(and(eq(items.id, itemId), eq(items.organizationId, organizationId)))
     .limit(1);
-  if (!row || (row.employeeId !== requesterId && !reviewerCanSee(access.data.role, row.employeeRole))) {
+  if (!row || (row.employeeId !== requesterId && !reviewerCanSee(access.data, row.employeeRole, row.employeeBranchId))) {
     return fail("not-found", "Item not found");
   }
   if (!row.key) return fail("not-found", "No proof has been uploaded");
@@ -462,7 +464,7 @@ export const listDeclarations = async (organizationId: string, requesterId: stri
       id: declarations.id,
       membershipId: memberships.id,
       employeeId: memberships.userId,
-      employeeRole: memberships.role,
+      employeeRole: memberships.role, employeeBranchId: memberships.branchId,
       fname: usersTable.fname,
       lname: usersTable.lname,
       employeeCode: memberships.employeeCode,
@@ -474,7 +476,7 @@ export const listDeclarations = async (organizationId: string, requesterId: stri
     .innerJoin(usersTable, eq(usersTable.id, memberships.userId))
     .where(and(eq(declarations.organizationId, organizationId), eq(declarations.financialYear, financialYear)));
   const visible = rows
-    .filter((row) => reviewerCanSee(access.data.role, row.employeeRole));
+    .filter((row) => reviewerCanSee(access.data, row.employeeRole, row.employeeBranchId));
   const itemRows = visible.length
     ? await db
         .select({ declarationId: items.declarationId, declaredAmount: items.declaredAmount, status: items.status, proof: items.proofStorageKey, section: items.section })
@@ -509,7 +511,7 @@ const loadDeclarationForReview = async (organizationId: string, declarationId: s
       id: declarations.id,
       membershipId: memberships.id,
       employeeId: memberships.userId,
-      employeeRole: memberships.role,
+      employeeRole: memberships.role, employeeBranchId: memberships.branchId,
       financialYear: declarations.financialYear,
       fname: usersTable.fname,
       lname: usersTable.lname,
@@ -526,7 +528,7 @@ export const getDeclarationForReview = async (organizationId: string, requesterI
   const access = await requireRole(organizationId, requesterId, PEOPLE_MANAGER_ROLES);
   if (!access.ok) return access;
   const row = await loadDeclarationForReview(organizationId, declarationId);
-  if (!row || !reviewerCanSee(access.data.role, row.employeeRole)) return fail("not-found", "Declaration not found");
+  if (!row || !reviewerCanSee(access.data, row.employeeRole, row.employeeBranchId)) return fail("not-found", "Declaration not found");
   const view = await buildView(organizationId, row.membershipId, row.financialYear);
   return ok({ ...view, employeeId: row.employeeId, employeeName: `${row.fname} ${row.lname}`.trim(), declarationId: row.id });
 };
@@ -547,7 +549,7 @@ export const reviewDeclarationItem = async (
     .limit(1);
   if (!row) return fail("not-found", "Item not found");
   const declaration = await loadDeclarationForReview(organizationId, row.declarationId);
-  if (!declaration || !reviewerCanSee(access.data.role, declaration.employeeRole)) return fail("not-found", "Item not found");
+  if (!declaration || !reviewerCanSee(access.data, declaration.employeeRole, declaration.employeeBranchId)) return fail("not-found", "Item not found");
   if (declaration.employeeId === requesterId && access.data.role !== UserRole.SUPER_ADMIN) {
     return fail("forbidden", "Someone else must verify your own declaration");
   }
@@ -666,7 +668,7 @@ export const loadForm12bb = async (organizationId: string, requesterId: string, 
   const access = await requireRole(organizationId, requesterId, ALL_ROLES);
   if (!access.ok) return access;
   const row = await loadDeclarationForReview(organizationId, declarationId);
-  if (!row || (row.employeeId !== requesterId && !reviewerCanSee(access.data.role, row.employeeRole))) {
+  if (!row || (row.employeeId !== requesterId && !reviewerCanSee(access.data, row.employeeRole, row.employeeBranchId))) {
     return fail("not-found", "Declaration not found");
   }
   const [[organization], [profile], view] = await Promise.all([

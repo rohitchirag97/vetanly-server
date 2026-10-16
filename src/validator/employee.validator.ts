@@ -9,10 +9,13 @@ export const createEmployeeSchema = z.object({
     .regex(/^\d{11,15}$/, "Include a valid country code and phone number"),
   role: z.enum([UserRole.ADMIN, UserRole.HR, UserRole.EMPLOYEE]),
   organizationId: z.uuid(),
+  branchId: z.uuid().optional(),
 });
 
 export const bulkCreateEmployeesSchema = z.object({
   organizationId: z.uuid(),
+  // Everyone in the upload joins this branch.
+  branchId: z.uuid().optional(),
   employees: z
     .array(
       z.object({

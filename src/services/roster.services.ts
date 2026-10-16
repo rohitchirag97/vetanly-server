@@ -14,7 +14,7 @@ import {
   type ShiftRotationStep,
   type ShiftSwapStatus,
 } from "@/drizzle/schema";
-import { ALL_ROLES, PEOPLE_MANAGER_ROLES, requireRole, type ActiveMembership } from "@/services/access.services";
+import { ALL_ROLES, branchCondition, canManageMember, PEOPLE_MANAGER_ROLES, requireRole, type ActiveMembership } from "@/services/access.services";
 import { notify, peopleManagerIds } from "@/services/notification.services";
 import { addDays, cycleLength, eachDay, resolveRosterDay, type RosterAssignment, type RosterSource } from "@/services/roster-calc";
 import { fail, ok, type ServiceResult } from "@/utils/result";
@@ -116,8 +116,8 @@ export const loadRoster = async (organizationId: string, from: string, to: strin
   return { byMembership, shifts };
 };
 
-const canManageEmployee = (access: ActiveMembership, employeeRole: string) =>
-  access.role !== UserRole.HR || employeeRole === UserRole.EMPLOYEE;
+const canManageEmployee = (access: ActiveMembership, member: { role: string; branchId: string | null }) =>
+  canManageMember(access, member);
 
 // ---------- Rotation patterns ----------
 
@@ -202,7 +202,7 @@ export const deleteRotation = async (organizationId: string, requesterId: string
 
 const loadMembers = (organizationId: string, employeeIds: string[]) =>
   db
-    .select({ id: memberships.id, userId: memberships.userId, role: memberships.role, isActive: memberships.isActive })
+    .select({ id: memberships.id, userId: memberships.userId, role: memberships.role, isActive: memberships.isActive, branchId: memberships.branchId })
     .from(memberships)
     .where(and(eq(memberships.organizationId, organizationId), inArray(memberships.userId, employeeIds)));
 
@@ -220,7 +220,7 @@ export const assignRotation = async (organizationId: string, requesterId: string
   if (members.length !== input.employeeIds.length || members.some((member) => !member.isActive)) {
     return fail("invalid", "Choose active employees of this organization");
   }
-  if (members.some((member) => !canManageEmployee(access.data, member.role))) return fail("forbidden");
+  if (members.some((member) => !canManageEmployee(access.data, member))) return fail("forbidden");
 
   await db.transaction(async (tx) => {
     for (const member of members) {
@@ -255,7 +255,7 @@ export const endRotation = async (organizationId: string, requesterId: string, i
   const access = await requireRole(organizationId, requesterId, PEOPLE_MANAGER_ROLES);
   if (!access.ok) return access;
   const members = await loadMembers(organizationId, input.employeeIds);
-  if (members.some((member) => !canManageEmployee(access.data, member.role))) return fail("forbidden");
+  if (members.some((member) => !canManageEmployee(access.data, member))) return fail("forbidden");
   const lastDay = addDays(input.fromDate, -1);
   await db.transaction(async (tx) => {
     for (const member of members) {
@@ -281,6 +281,8 @@ export const getRosterGrid = async (
   const conditions: SQL[] = [eq(memberships.organizationId, organizationId), eq(memberships.isActive, true)];
   if (query.departmentId) conditions.push(eq(memberships.departmentId, query.departmentId));
   if (access.data.role === UserRole.HR) conditions.push(eq(memberships.role, UserRole.EMPLOYEE));
+  const branches = branchCondition(access.data);
+  if (branches) conditions.push(branches);
   // The owner appears only when they are on payroll as an employee, as in payroll itself.
   conditions.push(or(ne(memberships.role, UserRole.SUPER_ADMIN), eq(memberships.includeInPayroll, true))!);
   const people = await db
@@ -331,7 +333,7 @@ export const setRosterOverride = async (organizationId: string, requesterId: str
   if (!access.ok) return access;
   const [member] = await loadMembers(organizationId, [input.employeeId]);
   if (!member?.isActive) return fail("not-found", "Employee not found");
-  if (!canManageEmployee(access.data, member.role)) return fail("forbidden");
+  if (!canManageEmployee(access.data, member)) return fail("forbidden");
   if (input.clear) {
     await db.delete(overrides).where(and(eq(overrides.userOrganizationId, member.id), eq(overrides.date, input.date)));
     return ok(null);
@@ -567,7 +569,19 @@ export const listSwapsForReview = async (organizationId: string, requesterId: st
   const rows = await db
     .select(swapColumns)
     .from(swaps)
-    .where(and(eq(swaps.organizationId, organizationId), status ? eq(swaps.status, status) : undefined))
+    .where(
+      and(
+        eq(swaps.organizationId, organizationId),
+        status ? eq(swaps.status, status) : undefined,
+        // A branch manager sees swaps asked for by people in their branches.
+        access.data.branchIds
+          ? inArray(
+              swaps.requesterMembershipId,
+              db.select({ id: memberships.id }).from(memberships).where(inArray(memberships.branchId, access.data.branchIds)),
+            )
+          : undefined,
+      ),
+    )
     .orderBy(desc(swaps.createdAt))
     .limit(100);
   return ok(await describeSwaps(organizationId, rows));
@@ -585,10 +599,10 @@ export const reviewSwap = async (
   const swap = await loadSwap(organizationId, swapId);
   if (!swap) return fail("not-found", "Swap request not found");
   const people = await db
-    .select({ id: memberships.id, userId: memberships.userId, role: memberships.role })
+    .select({ id: memberships.id, userId: memberships.userId, role: memberships.role, branchId: memberships.branchId })
     .from(memberships)
     .where(inArray(memberships.id, [swap.requesterMembershipId, swap.colleagueMembershipId]));
-  if (people.some((person) => !canManageEmployee(access.data, person.role))) return fail("forbidden");
+  if (people.some((person) => !canManageEmployee(access.data, person))) return fail("forbidden");
   if (people.some((person) => person.userId === requesterId) && access.data.role !== UserRole.SUPER_ADMIN) {
     return fail("forbidden", "Someone else must approve a swap you are part of");
   }

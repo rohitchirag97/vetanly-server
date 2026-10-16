@@ -5,16 +5,19 @@ const optionalText = (max: number) =>
     .string()
     .max(max, `Must be at most ${max} characters`)
     .nullish()
-    .transform((value) => (value?.trim() ? value.trim() : null));
+    // Left out means "unchanged"; empty means "clear".
+    .transform((value) => (value === undefined ? undefined : value?.trim() ? value.trim() : null));
 
 const isoDate = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Use the YYYY-MM-DD date format");
 
 export const profileSchema = z.object({
+  gender: z.enum(["male", "female", "other"]).nullish().transform((value) => (value === undefined ? undefined : value ?? null)),
+  bloodGroup: z.enum(["A+", "A-", "B+", "B-", "AB+", "AB-", "O+", "O-"]).nullish().transform((value) => (value === undefined ? undefined : value ?? null)),
   dateOfBirth: z
     .union([isoDate, z.literal(""), z.null()])
     .optional()
-    .transform((value) => value || null)
-    .refine((value) => value === null || (value >= "1900-01-01" && value <= new Date().toISOString().slice(0, 10)), {
+    .transform((value) => (value === undefined ? undefined : value || null))
+    .refine((value) => !value || (value >= "1900-01-01" && value <= new Date().toISOString().slice(0, 10)), {
       message: "Date of birth is not valid",
     }),
   addressLine1: optionalText(200),
@@ -26,7 +29,7 @@ export const profileSchema = z.object({
   emergencyContactName: optionalText(100),
   emergencyContactRelation: optionalText(50),
   emergencyContactPhone: optionalText(20).refine(
-    (value) => value === null || /^\+?[\d\s-]{6,20}$/.test(value),
+    (value) => !value || /^\+?[\d\s-]{6,20}$/.test(value),
     { message: "Emergency contact phone is not valid" },
   ),
   bankAccountHolder: optionalText(100),
@@ -40,10 +43,12 @@ export const profileSchema = z.object({
     .refine((value) => !value || /^[A-Za-z0-9]{6,34}$/.test(value), {
       message: "Bank account number must be 6-34 letters or digits",
     }),
-  bankIfsc: optionalText(20).refine(
-    (value) => value === null || /^[A-Za-z0-9]{4,20}$/.test(value),
-    { message: "IFSC / routing code must be 4-20 letters or digits" },
-  ),
+  bankIfsc: optionalText(20)
+    .refine((value) => !value || /^[A-Za-z0-9]{4,20}$/.test(value), {
+      message: "IFSC / routing code must be 4-20 letters or digits",
+    })
+    // Bank codes are upper case; storing them that way keeps bank files and comparisons consistent.
+    .transform((value) => (typeof value === "string" ? value.toUpperCase() : value)),
   upiId: optionalText(100),
 });
 

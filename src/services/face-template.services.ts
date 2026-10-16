@@ -6,13 +6,14 @@ import {
   employeeFaceTemplatesTable,
   kioskDevicesTable,
   userOrganizationsTable,
+  usersTable,
 } from "@/drizzle/schema";
 import {
   getEmployeeMembership,
   MANAGER_ROLES,
   requireRole,
 } from "@/services/access.services";
-import type { AuthenticatedKiosk } from "@/services/kiosk.services";
+import { type AuthenticatedKiosk, isEnrollmentUnlocked } from "@/services/kiosk.services";
 import { fail, ok, type ServiceResult } from "@/utils/result";
 import type {
   enrollFaceTemplateSchema,
@@ -36,6 +37,9 @@ export const enrollFaceTemplate = async (
   kiosk: AuthenticatedKiosk,
   input: z.infer<typeof enrollFaceTemplateSchema>,
 ): Promise<ServiceResult<{ id: string }>> => {
+  if (!(await isEnrollmentUnlocked(kiosk.id))) {
+    return fail("forbidden", "Enrollment is locked. Enter a manager's enrollment code on the kiosk.");
+  }
   const membership = await getEmployeeMembership(kiosk.organizationId, input.employeeId);
   if (!membership || !membership.isActive) {
     return fail("not-found", "Employee not found in this organization");
@@ -117,6 +121,35 @@ export const syncFaceTemplates = async (
     .set({ lastTemplateSyncAt: syncedAt })
     .where(eq(kioskDevicesTable.id, kiosk.id));
   return ok({ templates, syncedAt });
+};
+
+/** Active employees of the kiosk's organization, so it can pick whom to enroll and greet matches by name. */
+export const listKioskEmployees = async (
+  kiosk: AuthenticatedKiosk,
+): Promise<ServiceResult<{ id: string; name: string; employeeCode: string | null }[]>> => {
+  const rows = await db
+    .select({
+      id: userOrganizationsTable.userId,
+      fname: usersTable.fname,
+      lname: usersTable.lname,
+      employeeCode: userOrganizationsTable.employeeCode,
+    })
+    .from(userOrganizationsTable)
+    .innerJoin(usersTable, eq(usersTable.id, userOrganizationsTable.userId))
+    .where(
+      and(
+        eq(userOrganizationsTable.organizationId, kiosk.organizationId),
+        eq(userOrganizationsTable.isActive, true),
+      ),
+    )
+    .orderBy(usersTable.fname, usersTable.lname);
+  return ok(
+    rows.map((row) => ({
+      id: row.id,
+      name: `${row.fname} ${row.lname}`.trim(),
+      employeeCode: row.employeeCode,
+    })),
+  );
 };
 
 export const updateKioskDeviceInfo = async (

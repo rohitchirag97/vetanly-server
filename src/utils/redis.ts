@@ -38,6 +38,9 @@ export const get = async (key: string) => {
   return withRedis((client) => client.get(key));
 };
 
+/** Reads and removes the key in one step, so a one-time value can only be claimed once. */
+export const getAndDelete = async (key: string) => withRedis((client) => client.getdel(key));
+
 export const del = async (key: string) => {
   return withRedis((client) => client.del(key));
 };

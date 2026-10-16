@@ -337,7 +337,7 @@ export const createPlatformInvoice = async (actor: PlatformActor, input: Invoice
     if (!organization) return { status: "organization-missing" as const };
     if (!profile) return { status: "billing-profile-missing" as const };
 
-    await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext('hazripro-platform-invoice-number'))`);
+    await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext('vetanly-platform-invoice-number'))`);
     const [counter] = await tx.select({ value: sql<number>`count(*)::int` }).from(platformInvoicesTable);
     const sequence = Number(counter?.value ?? 0) + 1;
 

@@ -24,14 +24,17 @@ export type PdfEmail = {
   idempotencyKey: string;
 };
 
-/** Sends one email with a PDF attached. Outside production, a missing Resend setup only logs. */
-export const sendPdfEmail = async ({ idempotencyKey, ...mail }: PdfEmail) => {
+/**
+ * Sends one email with a PDF attached and returns Resend's id. Outside production, a missing Resend
+ * setup only logs and returns null.
+ */
+export const sendPdfEmail = async ({ idempotencyKey, ...mail }: PdfEmail): Promise<string | null> => {
   if (!isMailConfigured()) {
     if (process.env.NODE_ENV === "production") throw new Error("Email (Resend) is not configured");
     console.warn(`[email] Resend not configured; would send "${mail.subject}" (${mail.pdf.length} byte PDF)`);
-    return;
+    return null;
   }
-  const { error } = await getClient().emails.send(
+  const { data, error } = await getClient().emails.send(
     {
       from: env.EMAIL_FROM!,
       to: mail.to,
@@ -42,4 +45,5 @@ export const sendPdfEmail = async ({ idempotencyKey, ...mail }: PdfEmail) => {
     { idempotencyKey },
   );
   if (error) throw new Error(`Resend rejected the email: ${error.message}`);
+  return data?.id ?? null;
 };

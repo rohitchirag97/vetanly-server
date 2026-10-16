@@ -1,9 +1,10 @@
-import { and, desc, eq, gte, lte, min, type SQL } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, lte, min, type SQL } from "drizzle-orm";
 import type { z } from "zod";
 
 import db from "@/utils/db";
 import {
   attendanceLogsTable,
+  branchesTable,
   leaveRequestsTable,
   organizationPayrollSettingsTable,
   userOrganizationsTable,
@@ -15,22 +16,27 @@ import {
 } from "@/drizzle/schema";
 import {
   ALL_ROLES,
+  branchFilter,
+  canManageMember,
   getEmployeeMembership,
   PEOPLE_MANAGER_ROLES,
   requireRole,
 } from "@/services/access.services";
 import type { AuthenticatedKiosk } from "@/services/kiosk.services";
-import { eachDate } from "@/services/payroll-calc";
+import { eachDate, workedAfterBreak } from "@/services/payroll-calc";
 import { createLeaveRequest, updateLeaveStatus } from "@/services/leave.services";
-import { holidayDatesBetween } from "@/services/holiday.services";
+import { holidayDatesBetween, holidaysForBranch } from "@/services/holiday.services";
+import { checkGeofence } from "@/services/geofence";
 import { parseWeeklyOff } from "@/services/payroll-settings.services";
 import { enqueueAttendance } from "@/queue/producer/recordAttendance";
 import { loadRoster } from "@/services/roster.services";
+import { type ShiftTimes, workDateOf } from "@/services/work-day";
 import type { AttendanceJob } from "@/queue/types";
 import { fail, isUniqueViolation, ok, type ServiceResult } from "@/utils/result";
 import type {
   bulkManualAttendanceSchema,
   dailyAttendanceQuerySchema,
+  gpsAttendanceSchema,
   kioskAttendanceSchema,
   listAttendanceQuerySchema,
   manualAttendanceSchema,
@@ -165,9 +171,8 @@ const checkPunchRules = async (
     );
   }
 
-  const localDate = new Date(occurredAt.getTime() + utcOffsetMinutes * MINUTE_MS)
-    .toISOString()
-    .slice(0, 10);
+  // Leave and the one-check-in rule follow the work day, so a night shift's after-midnight punch is not refused.
+  const workDate = await workDateForPunch(organizationId, userOrganizationId, occurredAt, utcOffsetMinutes);
   const [leave] = await db
     .select({ id: leaveRequestsTable.id })
     .from(leaveRequestsTable)
@@ -177,39 +182,87 @@ const checkPunchRules = async (
         eq(leaveRequestsTable.userOrganizationId, userOrganizationId),
         eq(leaveRequestsTable.status, "approved"),
         eq(leaveRequestsTable.isHalfDay, false),
-        lte(leaveRequestsTable.startDate, localDate),
-        gte(leaveRequestsTable.endDate, localDate),
+        lte(leaveRequestsTable.startDate, workDate),
+        gte(leaveRequestsTable.endDate, workDate),
       ),
     )
     .limit(1);
   if (leave) return fail("conflict", "This employee is on approved leave on that date");
 
-  if (eventType === "check_in") {
-    const dayStart = new Date(`${localDate}T00:00:00.000Z`).getTime() - utcOffsetMinutes * MINUTE_MS;
-    const [existingCheckIn] = await db
-      .select({ id: attendanceLogsTable.id })
-      .from(attendanceLogsTable)
-      .where(
-        and(
-          eq(attendanceLogsTable.organizationId, organizationId),
-          eq(attendanceLogsTable.userOrganizationId, userOrganizationId),
-          eq(attendanceLogsTable.eventType, "check_in"),
-          gte(attendanceLogsTable.occurredAt, new Date(dayStart)),
-          lte(attendanceLogsTable.occurredAt, new Date(dayStart + 24 * 60 * MINUTE_MS - 1)),
-        ),
-      )
-      .limit(1);
-    if (existingCheckIn) {
-      return fail("conflict", "This employee has already checked in on that date");
-    }
+  if (
+    eventType === "check_in" &&
+    (await hasCheckInOnWorkDay(organizationId, userOrganizationId, workDate, utcOffsetMinutes))
+  ) {
+    return fail("conflict", "This employee has already checked in on that date");
   }
   return null;
+};
+
+/** The work day a punch belongs to for this employee: see work-day.ts. */
+const workDateForPunch = async (
+  organizationId: string,
+  userOrganizationId: string,
+  occurredAt: Date,
+  utcOffsetMinutes: number,
+) => {
+  const offsetMs = utcOffsetMinutes * MINUTE_MS;
+  const localDate = new Date(occurredAt.getTime() + offsetMs).toISOString().slice(0, 10);
+  const roster = await loadRoster(organizationId, previousDate(localDate), localDate, [userOrganizationId]);
+  return workDateAt(occurredAt, offsetMs, (day) => shiftTimes(roster, userOrganizationId, day));
+};
+
+/** The employee's punches on one work day, oldest first. */
+const punchesOnWorkDay = async (
+  organizationId: string,
+  userOrganizationId: string,
+  workDate: string,
+  utcOffsetMinutes: number,
+) => {
+  const offsetMs = utcOffsetMinutes * MINUTE_MS;
+  // A work day's punches fall on its own calendar date or, after midnight, the next one.
+  const from = Date.parse(`${workDate}T00:00:00Z`) - offsetMs;
+  const rows = await db
+    .select({ eventType: attendanceLogsTable.eventType, occurredAt: attendanceLogsTable.occurredAt })
+    .from(attendanceLogsTable)
+    .where(
+      and(
+        eq(attendanceLogsTable.organizationId, organizationId),
+        eq(attendanceLogsTable.userOrganizationId, userOrganizationId),
+        gte(attendanceLogsTable.occurredAt, new Date(from)),
+        lte(attendanceLogsTable.occurredAt, new Date(from + 2 * DAY_MINUTES * MINUTE_MS - 1)),
+      ),
+    )
+    .orderBy(attendanceLogsTable.occurredAt);
+  if (!rows.length) return rows;
+  const roster = await loadRoster(organizationId, previousDate(workDate), nextDate(workDate), [userOrganizationId]);
+  return rows.filter(
+    (row) => workDateAt(row.occurredAt, offsetMs, (day) => shiftTimes(roster, userOrganizationId, day)) === workDate,
+  );
+};
+
+const hasCheckInOnWorkDay = async (
+  organizationId: string,
+  userOrganizationId: string,
+  workDate: string,
+  utcOffsetMinutes: number,
+) =>
+  (await punchesOnWorkDay(organizationId, userOrganizationId, workDate, utcOffsetMinutes)).some(
+    (row) => row.eventType === "check_in",
+  );
+
+/** A face seen again within this window is the same visit, not a new punch. */
+const KIOSK_PUNCH_COOLDOWN_MS = 15 * MINUTE_MS;
+
+export type KioskAttendanceReceipt = AttendanceReceipt & {
+  eventType: AttendanceEventType;
+  /** True when the punch fell inside the cooldown and the earlier punch was returned instead. */
+  alreadyRecorded: boolean;
 };
 
 export const recordKioskAttendance = async (
   kiosk: AuthenticatedKiosk,
   input: z.infer<typeof kioskAttendanceSchema>,
-): Promise<ServiceResult<AttendanceReceipt>> => {
+): Promise<ServiceResult<KioskAttendanceReceipt>> => {
   const membership = await getEmployeeMembership(
     kiosk.organizationId,
     input.employeeId,
@@ -229,10 +282,47 @@ export const recordKioskAttendance = async (
     }
   }
 
+  // Measured from the punch's own time, so a replayed offline punch hits its earlier copy.
+  const [recent] = await db
+    .select({ eventType: attendanceLogsTable.eventType, occurredAt: attendanceLogsTable.occurredAt })
+    .from(attendanceLogsTable)
+    .where(
+      and(
+        eq(attendanceLogsTable.organizationId, kiosk.organizationId),
+        eq(attendanceLogsTable.userOrganizationId, membership.id),
+        gte(attendanceLogsTable.occurredAt, new Date(occurredAt.getTime() - KIOSK_PUNCH_COOLDOWN_MS)),
+        lte(attendanceLogsTable.occurredAt, occurredAt),
+      ),
+    )
+    .orderBy(desc(attendanceLogsTable.occurredAt))
+    .limit(1);
+  if (recent) {
+    return ok({
+      externalEventId: input.externalEventId ?? null,
+      occurredAt: recent.occurredAt,
+      queued: false,
+      eventType: recent.eventType,
+      alreadyRecorded: true,
+    });
+  }
+
+  // Without an explicit type: the work day's first punch is the check-in, every later one a check-out.
+  // The work day, not the calendar date, so a check-out after midnight is never mistaken for a new check-in.
+  const eventType =
+    input.eventType ??
+    ((await hasCheckInOnWorkDay(
+      kiosk.organizationId,
+      membership.id,
+      await workDateForPunch(kiosk.organizationId, membership.id, occurredAt, input.utcOffsetMinutes),
+      input.utcOffsetMinutes,
+    ))
+      ? "check_out"
+      : "check_in");
+
   const rejection = await checkPunchRules(
     kiosk.organizationId,
     membership.id,
-    input.eventType,
+    eventType,
     occurredAt,
     input.utcOffsetMinutes,
   );
@@ -244,14 +334,14 @@ export const recordKioskAttendance = async (
     userOrganizationId: membership.id,
     source: "kiosk",
     kioskId: kiosk.id,
-    eventType: input.eventType,
+    eventType,
     externalEventId: input.externalEventId ?? crypto.randomUUID(),
     occurredAt: occurredAt.toISOString(),
     faceMatchScore: input.faceMatchScore,
     livenessPassed: input.livenessPassed,
     faceTemplateId: input.faceTemplateId,
   };
-  return ok(await submitAttendance(job));
+  return ok({ ...(await submitAttendance(job)), eventType, alreadyRecorded: false });
 };
 
 export const recordManualAttendance = async (
@@ -266,9 +356,7 @@ export const recordManualAttendance = async (
   if (!membership || !membership.isActive) {
     return fail("not-found", "Employee not found in this organization");
   }
-  if (access.data.role === UserRole.HR && membership.role !== UserRole.EMPLOYEE) {
-    return fail("forbidden");
-  }
+  if (!canManageMember(access.data, membership)) return fail("forbidden");
   const occurredAt = resolveOccurredAt(input.occurredAt);
   if (!occurredAt) return fail("invalid", "Event time cannot be in the future");
 
@@ -417,6 +505,9 @@ export const recordBulkManualAttendance = async (
   return ok(results);
 };
 
+/** Daily attendance query, narrowed by role and branches after authorization. */
+type DailyQuery = z.infer<typeof dailyAttendanceQuerySchema> & { employeeRole?: string; branchIds?: string[] };
+
 export type DayStatus = "present" | "half_day" | "absent" | "incomplete" | "on_leave";
 
 export type DailyAttendance = {
@@ -429,12 +520,27 @@ export type DailyAttendance = {
   expectedMinutes: number | null;
   lateMinutes: number;
   earlyLeaveMinutes: number;
+  /** Time worked beyond the shift on a full day; before any approval. Payroll and overtime read this. */
+  overtimeMinutes: number;
   status: DayStatus;
 };
 
 const DAY_MINUTES = 1440;
-// How long after a night shift ends a check-out still belongs to that night.
-const NIGHT_CHECKOUT_GRACE_MINUTES = 240;
+
+type Roster = Awaited<ReturnType<typeof loadRoster>>;
+
+const shiftTimes = (roster: Roster, membershipId: string, date: string): ShiftTimes | null => {
+  const shift = roster.byMembership.get(membershipId)?.get(date)?.shift;
+  return shift ? { startTime: shift.startTime, endTime: shift.endTime } : null;
+};
+
+/** The work day of a punch, from the shifts rostered on its local date and the day before. */
+const workDateAt = (occurredAt: Date, offsetMs: number, shiftOn: (date: string) => ShiftTimes | null) => {
+  const local = new Date(occurredAt.getTime() + offsetMs);
+  const localDate = local.toISOString().slice(0, 10);
+  const minuteOfDay = local.getUTCHours() * 60 + local.getUTCMinutes();
+  return workDateOf(localDate, minuteOfDay, shiftOn(localDate), shiftOn(previousDate(localDate)));
+};
 
 const toMinutes = (time: string) => {
   const [hours, minutes] = time.split(":").map(Number);
@@ -473,7 +579,9 @@ export const getDailyAttendance = async (
   const employeeRole = access.data.role === UserRole.HR
     ? employeeId === requesterId ? UserRole.HR : UserRole.EMPLOYEE
     : undefined;
-  const effective = { ...query, employeeId, employeeRole };
+  // A manager looking at their own attendance is not limited to their branches.
+  const branchIds = employeeId === requesterId ? undefined : branchFilter(access.data, query.branchId);
+  const effective = { ...query, employeeId, employeeRole, branchIds };
   const punched = await computeDailyAttendance(organizationId, effective);
   const gaps = await missingDays(organizationId, effective, punched);
   return ok(
@@ -493,7 +601,7 @@ const weekdayOf = (date: string) => new Date(`${date}T00:00:00Z`).getUTCDay();
  */
 const missingDays = async (
   organizationId: string,
-  query: z.infer<typeof dailyAttendanceQuerySchema> & { employeeRole?: string },
+  query: DailyQuery,
   punched: DailyAttendance[],
 ): Promise<DailyAttendance[]> => {
   const offsetMs = query.utcOffsetMinutes * MINUTE_MS;
@@ -510,6 +618,7 @@ const missingDays = async (
   ];
   if (query.employeeId) memberFilter.push(eq(userOrganizationsTable.userId, query.employeeId));
   if (query.employeeRole) memberFilter.push(eq(userOrganizationsTable.role, query.employeeRole));
+  if (query.branchIds) memberFilter.push(inArray(userOrganizationsTable.branchId, query.branchIds));
 
   const [members, firstPunches, leaves, holidays, [settings]] = await Promise.all([
     db
@@ -517,6 +626,7 @@ const missingDays = async (
         id: userOrganizationsTable.id,
         userId: userOrganizationsTable.userId,
         hireDate: userOrganizationsTable.hireDate,
+        branchId: userOrganizationsTable.branchId,
         fname: usersTable.fname,
         lname: usersTable.lname,
       })
@@ -555,7 +665,6 @@ const missingDays = async (
   ]);
 
   const weeklyOff = settings ? parseWeeklyOff(settings.weeklyOffDays) : [0];
-  const holidaySet = new Set(holidays);
   const firstPunchOf = new Map(
     firstPunches.map((row) => [
       row.userOrganizationId,
@@ -570,6 +679,7 @@ const missingDays = async (
     const startsOn = member.hireDate ?? firstPunchOf.get(member.id) ?? null;
     if (!startsOn) continue;
     const memberLeaves = leaves.filter((leave) => leave.userOrganizationId === member.id);
+    const holidaySet = new Set(holidaysForBranch(holidays, member.branchId));
     for (const date of eachDate(query.from, to)) {
       if (date < startsOn) continue;
       if (weeklyOff.includes(weekdayOf(date)) || holidaySet.has(date)) continue;
@@ -585,6 +695,7 @@ const missingDays = async (
         expectedMinutes: null,
         lateMinutes: 0,
         earlyLeaveMinutes: 0,
+        overtimeMinutes: 0,
         status: onLeave ? "on_leave" : "absent",
       });
     }
@@ -595,7 +706,7 @@ const missingDays = async (
 /** Access-unchecked calculation shared with payroll. Callers must authorize first. */
 export const computeDailyAttendance = async (
   organizationId: string,
-  query: z.infer<typeof dailyAttendanceQuerySchema> & { employeeRole?: string },
+  query: DailyQuery,
 ): Promise<DailyAttendance[]> => {
   const employeeId = query.employeeId;
   const offsetMs = query.utcOffsetMinutes * MINUTE_MS;
@@ -611,6 +722,7 @@ export const computeDailyAttendance = async (
   ];
   if (employeeId) conditions.push(eq(userOrganizationsTable.userId, employeeId));
   if (query.employeeRole) conditions.push(eq(userOrganizationsTable.role, query.employeeRole));
+  if (query.branchIds) conditions.push(inArray(userOrganizationsTable.branchId, query.branchIds));
 
   const [rows, [settings]] = await Promise.all([
     db
@@ -665,22 +777,8 @@ export const computeDailyAttendance = async (
   const shifts = new Map<string, ReturnType<typeof shiftOn>>();
 
   for (const row of rows) {
-    const local = new Date(row.occurredAt.getTime() + offsetMs);
-    let date = local.toISOString().slice(0, 10);
-    // An early-morning punch belongs to the previous day when that day's shift ran past midnight.
-    const previousShift = shiftOn(row.membershipId, previousDate(date));
-    if (
-      previousShift.shiftStart &&
-      previousShift.shiftEnd &&
-      toMinutes(previousShift.shiftEnd) < toMinutes(previousShift.shiftStart)
-    ) {
-      const minuteOfDay = Math.floor(
-        ((row.occurredAt.getTime() + offsetMs) % (DAY_MINUTES * MINUTE_MS)) / MINUTE_MS,
-      );
-      // A check-out may run past the shift end (overtime, a late handover); a check-in may not.
-      const window = row.eventType === "check_out" ? NIGHT_CHECKOUT_GRACE_MINUTES : 0;
-      if (minuteOfDay <= toMinutes(previousShift.shiftEnd) + window) date = previousDate(date);
-    }
+    // Punches after midnight stay on the day the work started (night shifts, late overtime).
+    const date = workDateAt(row.occurredAt, offsetMs, (day) => shiftTimes(roster, row.membershipId, day));
     const key = `${row.employeeId}|${date}`;
     if (!days.has(key)) {
       days.set(key, {
@@ -693,6 +791,7 @@ export const computeDailyAttendance = async (
         expectedMinutes: null,
         lateMinutes: 0,
         earlyLeaveMinutes: 0,
+        overtimeMinutes: 0,
         status: "incomplete",
       });
       punches.set(key, { firstIn: null, lastOut: null, fixedIn: null, fixedOut: null });
@@ -729,9 +828,9 @@ export const computeDailyAttendance = async (
       const start = toMinutes(shift.shiftStart);
       const end = toMinutes(shift.shiftEnd);
       if (end < start && elapsedMinutes < 0) elapsedMinutes += DAY_MINUTES;
-      day.workedMinutes = Math.max(0, elapsedMinutes - breakMinutes);
-
       const span = (end - start + DAY_MINUTES) % DAY_MINUTES;
+      day.workedMinutes = workedAfterBreak(elapsedMinutes, span, breakMinutes);
+
       const expected = span - breakMinutes;
       if (expected > 0) {
         day.expectedMinutes = expected;
@@ -760,6 +859,9 @@ export const computeDailyAttendance = async (
       day.workedMinutes = Math.max(0, elapsedMinutes - breakMinutes);
       // Without an assigned shift there is nothing to measure the day against.
       day.status = "present";
+    }
+    if (day.status === "present" && day.workedMinutes !== null && day.expectedMinutes) {
+      day.overtimeMinutes = Math.max(0, day.workedMinutes - day.expectedMinutes);
     }
   }
 
@@ -792,6 +894,8 @@ export const listAttendance = async (
       ),
     );
   }
+  const branchIds = isManager && employeeId !== requesterId ? branchFilter(access.data, query.branchId) : undefined;
+  if (branchIds) conditions.push(inArray(userOrganizationsTable.branchId, branchIds));
   if (query.from) conditions.push(gte(attendanceLogsTable.occurredAt, new Date(query.from)));
   if (query.to) conditions.push(lte(attendanceLogsTable.occurredAt, new Date(query.to)));
 
@@ -800,4 +904,108 @@ export const listAttendance = async (
     .limit(query.limit)
     .offset(query.offset);
   return ok(rows.map(toLog));
+};
+
+// ---------- GPS check-in from the employee's phone ----------
+
+const gpsContext = async (organizationId: string, membershipId: string) => {
+  const [row] = await db
+    .select({
+      branchId: branchesTable.id,
+      name: branchesTable.name,
+      latitude: branchesTable.latitude,
+      longitude: branchesTable.longitude,
+      radius: branchesTable.geofenceRadiusMeters,
+      gpsCheckIn: branchesTable.gpsCheckIn,
+      isActive: branchesTable.isActive,
+    })
+    .from(userOrganizationsTable)
+    .innerJoin(branchesTable, eq(branchesTable.id, userOrganizationsTable.branchId))
+    .where(and(eq(userOrganizationsTable.id, membershipId), eq(userOrganizationsTable.organizationId, organizationId)))
+    .limit(1);
+  if (!row || !row.isActive || !row.gpsCheckIn || row.latitude === null || row.longitude === null) return null;
+  return { ...row, latitude: Number(row.latitude), longitude: Number(row.longitude) };
+};
+
+/** The current work day's first check-in and last check-out (a night shift's still counts after midnight). */
+const todaysPunches = async (organizationId: string, membershipId: string, utcOffsetMinutes: number) => {
+  const workDate = await workDateForPunch(organizationId, membershipId, new Date(), utcOffsetMinutes);
+  const rows = await punchesOnWorkDay(organizationId, membershipId, workDate, utcOffsetMinutes);
+  return {
+    checkedInAt: rows.find((row) => row.eventType === "check_in")?.occurredAt ?? null,
+    checkedOutAt: rows.filter((row) => row.eventType === "check_out").at(-1)?.occurredAt ?? null,
+  };
+};
+
+/** Whether the employee can check in by GPS, their branch's geofence, and today's punches. */
+export const getGpsStatus = async (organizationId: string, requesterId: string, utcOffsetMinutes: number) => {
+  const access = await requireRole(organizationId, requesterId, ALL_ROLES);
+  if (!access.ok) return access;
+  const branch = await gpsContext(organizationId, access.data.id);
+  return ok({
+    enabled: !!branch,
+    branch: branch ? { name: branch.name, latitude: branch.latitude, longitude: branch.longitude, radiusMeters: branch.radius } : null,
+    ...(branch ? await todaysPunches(organizationId, access.data.id, utcOffsetMinutes) : { checkedInAt: null, checkedOutAt: null }),
+  });
+};
+
+/** A check-in or check-out from the employee's phone, accepted only inside their branch's geofence. */
+export const recordGpsAttendance = async (
+  organizationId: string,
+  requesterId: string,
+  input: z.infer<typeof gpsAttendanceSchema>,
+): Promise<ServiceResult<{ occurredAt: Date; distanceMeters: number; branchName: string }>> => {
+  const access = await requireRole(organizationId, requesterId, ALL_ROLES);
+  if (!access.ok) return access;
+  const branch = await gpsContext(organizationId, access.data.id);
+  if (!branch) return fail("forbidden", "GPS check-in is not turned on for your branch");
+
+  const check = checkGeofence({
+    at: { latitude: input.latitude, longitude: input.longitude },
+    accuracy: input.accuracyMeters,
+    branch,
+    radius: branch.radius,
+  });
+  if (!check.ok) {
+    return fail(
+      "invalid",
+      check.reason === "imprecise"
+        ? `Your location is too imprecise (±${Math.round(input.accuracyMeters)} m). Turn on precise location and try again, ideally near a window or outdoors.`
+        : `You are ${check.distance} m from ${branch.name}. GPS check-in works within ${branch.radius} m.`,
+    );
+  }
+
+  const occurredAt = new Date();
+  if (input.eventType === "check_out") {
+    // A check-out needs a check-in in the last 20 hours (night shifts cross midnight).
+    const [recent] = await db
+      .select({ id: attendanceLogsTable.id })
+      .from(attendanceLogsTable)
+      .where(
+        and(
+          eq(attendanceLogsTable.userOrganizationId, access.data.id),
+          eq(attendanceLogsTable.eventType, "check_in"),
+          gte(attendanceLogsTable.occurredAt, new Date(occurredAt.getTime() - 20 * 60 * MINUTE_MS)),
+        ),
+      )
+      .limit(1);
+    if (!recent) return fail("conflict", "Check in first");
+  }
+  const rejection = await checkPunchRules(organizationId, access.data.id, input.eventType, occurredAt, input.utcOffsetMinutes);
+  if (rejection) return rejection;
+
+  await db.insert(attendanceLogsTable).values({
+    organizationId,
+    userOrganizationId: access.data.id,
+    eventType: input.eventType,
+    source: "gps",
+    faceVerificationStatus: "not_applicable",
+    latitude: input.latitude.toFixed(6),
+    longitude: input.longitude.toFixed(6),
+    accuracyMeters: Math.round(input.accuracyMeters),
+    distanceMeters: check.distance,
+    branchId: branch.branchId,
+    occurredAt,
+  });
+  return ok({ occurredAt, distanceMeters: check.distance, branchName: branch.name });
 };

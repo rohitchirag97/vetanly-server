@@ -8,9 +8,9 @@ import {
   userOrganizationsTable,
   usersTable,
 } from "@/drizzle/schema";
-import { ALL_ROLES, MANAGER_ROLES, requireRole } from "@/services/access.services";
-import { enqueueLoanNocWhatsApp } from "@/queue/producer/sendSalarySlipWhatsApp";
-import { enqueueLoanNocEmail } from "@/queue/producer/sendDocumentEmail";
+import { ALL_ROLES, isOrganizationManager, MANAGER_ROLES, requireRole } from "@/services/access.services";
+import { queueDelivery, sendableChannels } from "@/services/messaging.services";
+import { maskEmail, maskPhone } from "@/services/messaging-template";
 import { deliveryChannels, type DeliveryChannels } from "@/services/user.services";
 import { requireFullAccess } from "@/services/billing-access.services";
 import { fail, ok, type ServiceResult } from "@/utils/result";
@@ -99,7 +99,7 @@ const authorize = async (organizationId: string, requesterId: string, recoverabl
   if (!access.ok) return access;
   const loaded = await loadLoanNoc(organizationId, recoverableId);
   if (!loaded.ok) return loaded;
-  if (!MANAGER_ROLES.includes(access.data.role) && loaded.data.employeeId !== requesterId) {
+  if (!isOrganizationManager(access.data) && loaded.data.employeeId !== requesterId) {
     return fail("not-found", "Record not found");
   }
   return loaded;
@@ -109,9 +109,10 @@ export const getLoanNoc = async (
   organizationId: string,
   requesterId: string,
   recoverableId: string,
-): Promise<ServiceResult<LoanNoc & { delivery: DeliveryChannels }>> => {
+): Promise<ServiceResult<LoanNoc & { delivery: DeliveryChannels & { addon: boolean } }>> => {
   const loaded = await authorize(organizationId, requesterId, recoverableId);
-  return loaded.ok ? ok({ ...loaded.data.noc, delivery: loaded.data.delivery }) : loaded;
+  if (!loaded.ok) return loaded;
+  return ok({ ...loaded.data.noc, delivery: await sendableChannels(organizationId, "loan_noc", loaded.data.delivery) });
 };
 
 export const requestLoanNocWhatsApp = async (
@@ -126,8 +127,16 @@ export const requestLoanNocWhatsApp = async (
   if (!loaded.data.delivery.whatsapp) {
     return fail("invalid", "This employee has no phone number linked for WhatsApp");
   }
-  await enqueueLoanNocWhatsApp({ organizationId, recoverableId, requestedByUserId: requesterId });
-  return ok(null);
+  const queued = await queueDelivery({
+    organizationId,
+    requesterId,
+    channel: "whatsapp",
+    messageType: "loan_noc",
+    relatedId: recoverableId,
+    recipientUserId: loaded.data.employeeId,
+    recipientMasked: maskPhone(loaded.data.phone),
+  });
+  return queued.ok ? ok(null) : queued;
 };
 
 export const requestLoanNocEmail = async (
@@ -139,9 +148,17 @@ export const requestLoanNocEmail = async (
   if (!loaded.ok) return loaded;
   const billing = await requireFullAccess(organizationId);
   if (!billing.ok) return billing;
-  if (!loaded.data.delivery.email) {
+  if (!loaded.data.delivery.email || !loaded.data.email) {
     return fail("invalid", "This employee has no Google email linked");
   }
-  await enqueueLoanNocEmail({ organizationId, recoverableId, requestedByUserId: requesterId });
-  return ok(null);
+  const queued = await queueDelivery({
+    organizationId,
+    requesterId,
+    channel: "email",
+    messageType: "loan_noc",
+    relatedId: recoverableId,
+    recipientUserId: loaded.data.employeeId,
+    recipientMasked: maskEmail(loaded.data.email),
+  });
+  return queued.ok ? ok(null) : queued;
 };

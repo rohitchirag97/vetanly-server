@@ -1,5 +1,5 @@
 import db from "@/utils/db";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import {
   organizationsTable,
   userOrganizationsTable,
@@ -138,7 +138,7 @@ export const getOrganizationwithUser: (
 export const getUsersOrganizations: (
   userId: string,
 ) => Promise<
-  Array<Organization & { role: UserRole; membershipActive: boolean }>
+  Array<Organization & { role: UserRole; membershipActive: boolean; branchLimited: boolean }>
 > = async (userId: string) => {
   const organizations = await db
     .select({
@@ -151,6 +151,8 @@ export const getUsersOrganizations: (
       deletionScheduledAt: organizationsTable.deletionScheduledAt,
       role: userOrganizationsTable.role,
       membershipActive: userOrganizationsTable.isActive,
+      // Limited to some branches: finance and organization settings are hidden.
+      branchLimited: sql<boolean>`exists (select 1 from branch_managers bm where bm.user_organization_id = ${userOrganizationsTable.id})`,
     })
     .from(organizationsTable)
     .innerJoin(
@@ -160,7 +162,7 @@ export const getUsersOrganizations: (
     .where(eq(userOrganizationsTable.userId, userId));
 
   return organizations as Array<
-    Organization & { role: UserRole; membershipActive: boolean }
+    Organization & { role: UserRole; membershipActive: boolean; branchLimited: boolean }
   >;
 };
 

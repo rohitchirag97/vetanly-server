@@ -6,6 +6,7 @@ import { getDailyAttendance } from "@/services/attendance.services";
 import { listLeaveRequests } from "@/services/leave.services";
 import { getRun } from "@/services/payroll.services";
 import { listRecoverables } from "@/services/recoverable.services";
+import { buildBankTransfer, buildMusterRoll, buildWageRegister } from "@/services/register-reports.services";
 import { db_organizationName } from "@/services/report-meta";
 import { buildForm16, buildStatutoryRunReport } from "@/services/statutory-report.services";
 import { fail, ok, type ServiceResult } from "@/utils/result";
@@ -22,6 +23,8 @@ export type ReportTable = {
   rows: ReportCell[][];
   totals?: ReportCell[];
   notes?: string[];
+  /** Smaller font and padding for wide tables in the PDF. */
+  compact?: boolean;
   form16?: Form16Data;
 };
 
@@ -44,7 +47,7 @@ export const buildReport = async (
   requesterId: string,
   query: z.infer<typeof reportQuerySchema>,
 ): Promise<ServiceResult<ReportTable>> => {
-  const peopleReport = query.type === "attendance" || query.type === "leave";
+  const peopleReport = query.type === "attendance" || query.type === "leave" || query.type === "muster";
   const access = await requireRole(
     organizationId,
     requesterId,
@@ -63,11 +66,27 @@ export const buildReport = async (
     return buildStatutoryRunReport(organizationId, requesterId, query.type, query.runId, organizationName);
   }
 
+  if (query.type === "bank" || query.type === "wages") {
+    if (!query.runId) return fail("invalid", "Choose a payroll run");
+    return query.type === "bank"
+      ? buildBankTransfer(organizationId, requesterId, query.runId, organizationName)
+      : buildWageRegister(organizationId, requesterId, query.runId, organizationName);
+  }
+  if (query.type === "muster") {
+    return buildMusterRoll(
+      organizationId,
+      requesterId,
+      { from: query.from, to: query.to, utcOffsetMinutes: query.utcOffsetMinutes, branchId: query.branchId },
+      organizationName,
+    );
+  }
+
   if (query.type === "attendance") {
     const daily = await getDailyAttendance(organizationId, requesterId, {
       from: query.from,
       to: query.to,
       utcOffsetMinutes: query.utcOffsetMinutes,
+      branchId: query.branchId,
     });
     if (!daily.ok) return daily;
     const rows = daily.data
@@ -103,7 +122,7 @@ export const buildReport = async (
   }
 
   if (query.type === "leave") {
-    const requests = await listLeaveRequests(organizationId, requesterId, {});
+    const requests = await listLeaveRequests(organizationId, requesterId, { branchId: query.branchId });
     if (!requests.ok) return requests;
     const rows = requests.data
       .filter((r) => r.startDate <= query.to && r.endDate >= query.from)
@@ -176,9 +195,12 @@ export const buildReport = async (
   if (!query.runId) return fail("invalid", "Choose a payroll run");
   const run = await getRun(organizationId, requesterId, query.runId);
   if (!run.ok) return run;
-  const rows = run.data.items.map((i): ReportCell[] => [
+  const rows = run.data.items
+    .filter((i) => !query.branchId || i.branchId === query.branchId)
+    .map((i): ReportCell[] => [
     i.employeeName,
     i.employeeCode ?? "",
+    i.branchName ?? "",
     i.departmentName ?? "",
     Number(i.workingDays),
     Number(i.presentDays) + Number(i.halfDays) / 2,
@@ -196,6 +218,7 @@ export const buildReport = async (
     columns: [
       { header: "Employee", width: 26 },
       { header: "Code", width: 10 },
+      { header: "Branch", width: 16 },
       { header: "Department", width: 18 },
       { header: "Working days", align: "right", width: 10 },
       { header: "Present", align: "right", width: 9 },
@@ -206,6 +229,6 @@ export const buildReport = async (
       { header: "Net pay", align: "right", width: 12 },
     ],
     rows,
-    totals: ["Total", null, null, null, null, null, null, sum(rows, 7), sum(rows, 8), sum(rows, 9)],
+    totals: ["Total", null, null, null, null, null, null, null, sum(rows, 8), sum(rows, 9), sum(rows, 10)],
   });
 };

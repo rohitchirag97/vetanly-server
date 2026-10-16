@@ -15,6 +15,7 @@ import {
   getEmployeeMembership,
   MANAGER_ROLES,
   requireRole,
+  isOrganizationManager,
 } from "@/services/access.services";
 import { managerIds, notify } from "@/services/notification.services";
 import { fail, ok, type ServiceResult } from "@/utils/result";
@@ -131,7 +132,7 @@ export const createRecoverable = async (
   const access = await requireRole(organizationId, requesterId, ALL_ROLES);
   if (!access.ok) return access;
 
-  const isManager = MANAGER_ROLES.includes(access.data.role);
+  const isManager = isOrganizationManager(access.data);
   const employeeId = isManager ? (input.employeeId ?? requesterId) : requesterId;
   if (!isManager && input.employeeId && input.employeeId !== requesterId) {
     return fail("forbidden");
@@ -204,7 +205,7 @@ export const listRecoverables = async (
   const access = await requireRole(organizationId, requesterId, ALL_ROLES);
   if (!access.ok) return access;
 
-  const isManager = MANAGER_ROLES.includes(access.data.role);
+  const isManager = isOrganizationManager(access.data);
   if (!isManager && query.employeeId && query.employeeId !== requesterId) {
     return fail("forbidden");
   }
@@ -234,7 +235,7 @@ export const getRecoverable = async (
   if (!access.ok) return access;
   const recoverable = await loadOne(organizationId, recoverableId);
   if (!recoverable) return fail("not-found", "Record not found");
-  if (!MANAGER_ROLES.includes(access.data.role) && recoverable.employeeId !== requesterId) {
+  if (!isOrganizationManager(access.data) && recoverable.employeeId !== requesterId) {
     return fail("not-found", "Record not found");
   }
   return ok(recoverable);
@@ -252,7 +253,7 @@ export const updateRecoverableStatus = async (
   const current = await loadOne(organizationId, recoverableId);
   if (!current) return fail("not-found", "Record not found");
 
-  const isManager = MANAGER_ROLES.includes(access.data.role);
+  const isManager = isOrganizationManager(access.data);
   const isOwnPendingCancel =
     input.status === "cancelled" &&
     current.status === "pending" &&
@@ -313,7 +314,7 @@ export const listAllRepayments = async (
 ) => {
   const access = await requireRole(organizationId, requesterId, ALL_ROLES);
   if (!access.ok) return access;
-  const isManager = MANAGER_ROLES.includes(access.data.role);
+  const isManager = isOrganizationManager(access.data);
 
   const conditions: SQL[] = [eq(repayments.organizationId, organizationId)];
   if (!isManager) conditions.push(eq(userOrganizationsTable.userId, requesterId));
@@ -450,7 +451,7 @@ export const createRepayment = async (
 ): Promise<ServiceResult<Recoverable>> => {
   const access = await requireRole(organizationId, requesterId, ALL_ROLES);
   if (!access.ok) return access;
-  const isManager = MANAGER_ROLES.includes(access.data.role);
+  const isManager = isOrganizationManager(access.data);
   if (!isManager) {
     const own = await getRecoverable(organizationId, requesterId, recoverableId);
     if (!own.ok) return own;

@@ -217,13 +217,18 @@ export const computeMonthlyTds = (
   settings: StatutorySettings,
   employee: EmployeeStatutory,
   ytd: YearToDate,
+  /** A one-off taxable payment this month (a bonus): taxed in full now, not projected as if it repeated. */
+  oneTimeIncome = 0,
 ) => {
-  if (!settings.tdsEnabled || gross <= 0) return 0;
+  if (!settings.tdsEnabled || gross + oneTimeIncome <= 0) return 0;
   const remaining = monthsRemaining(periodEnd);
   const projectedGross = ytd.gross + gross * remaining;
   const projectedPt = ytd.professionalTax + professionalTax * remaining;
   const { total } = annualTax(projectedGross, employee.taxRegime, projectedPt, employee.declaredDeductions);
-  return Math.max(0, rupees((total - ytd.tds) / remaining));
+  const regularMonthly = Math.max(0, (total - ytd.tds) / remaining);
+  if (oneTimeIncome <= 0) return rupees(regularMonthly);
+  const withOneTime = annualTax(projectedGross + oneTimeIncome, employee.taxRegime, projectedPt, employee.declaredDeductions).total;
+  return rupees(regularMonthly + Math.max(0, withOneTime - total));
 };
 
 export const emptyBreakup = (regime: TaxRegime): StatutoryBreakup => ({

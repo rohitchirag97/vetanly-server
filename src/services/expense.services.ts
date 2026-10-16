@@ -12,7 +12,7 @@ import {
   usersTable,
   type ExpenseCategory,
 } from "@/drizzle/schema";
-import { ALL_ROLES, getEmployeeMembership, MANAGER_ROLES, PEOPLE_MANAGER_ROLES, requireRole } from "@/services/access.services";
+import { ALL_ROLES, branchCondition, canManageMember, getEmployeeMembership, MANAGER_ROLES, PEOPLE_MANAGER_ROLES, requireRole } from "@/services/access.services";
 import { detectType, MAX_DOCUMENT_BYTES } from "@/services/employee-document.services";
 import { managerIds, notify, peopleManagerIds } from "@/services/notification.services";
 import { isFileStorageAvailable, removeFile, signedDownloadUrl, storeFile } from "@/utils/file-storage";
@@ -48,6 +48,7 @@ const columns = {
   id: claims.id,
   employeeId: userOrganizationsTable.userId,
   employeeRole: userOrganizationsTable.role,
+  employeeBranchId: userOrganizationsTable.branchId,
   fname: usersTable.fname,
   lname: usersTable.lname,
   category: claims.category,
@@ -117,6 +118,8 @@ export const listClaims = async (
   const conditions: SQL[] = [eq(claims.organizationId, organizationId)];
   // HR handles employees' claims only, never admins' or their own.
   if (access.data.role === UserRole.HR) conditions.push(eq(userOrganizationsTable.role, UserRole.EMPLOYEE));
+  const branches = branchCondition(access.data);
+  if (branches) conditions.push(branches);
   if (query.status) conditions.push(eq(claims.status, query.status));
   if (query.employeeId) conditions.push(eq(userOrganizationsTable.userId, query.employeeId));
   const rows = await selectClaims(and(...conditions)).orderBy(desc(claims.createdAt)).limit(500);
@@ -229,7 +232,7 @@ export const reviewClaim = async (
   if (!access.ok) return access;
   const current = await loadOne(organizationId, claimId);
   if (!current) return fail("not-found", "Claim not found");
-  if (access.data.role === UserRole.HR && current.employeeRole !== UserRole.EMPLOYEE) {
+  if (!canManageMember(access.data, { role: current.employeeRole, branchId: current.employeeBranchId })) {
     return fail("not-found", "Claim not found");
   }
   // An admin cannot approve their own claim; the owner has no one above them, so they may.
@@ -308,6 +311,7 @@ export const getReceiptUrl = async (
       name: claims.receiptName,
       employeeId: userOrganizationsTable.userId,
       employeeRole: userOrganizationsTable.role,
+      employeeBranchId: userOrganizationsTable.branchId,
     })
     .from(claims)
     .innerJoin(userOrganizationsTable, eq(userOrganizationsTable.id, claims.userOrganizationId))
@@ -317,8 +321,8 @@ export const getReceiptUrl = async (
   const canView =
     row &&
     (row.employeeId === requesterId ||
-      MANAGER_ROLES.includes(access.data.role) ||
-      (access.data.role === UserRole.HR && row.employeeRole === UserRole.EMPLOYEE));
+      (PEOPLE_MANAGER_ROLES.includes(access.data.role) &&
+        canManageMember(access.data, { role: row.employeeRole, branchId: row.employeeBranchId })));
   if (!canView) return fail("not-found", "Claim not found");
   if (!row.key) return fail("not-found", "This claim has no receipt");
   if (!isFileStorageAvailable()) return fail("invalid", "File storage is not configured");
@@ -359,3 +363,21 @@ export const settleClaimsInPayroll = async (tx: Tx, organizationId: string, runI
     .returning({ id: claims.id });
   return settled.length === claimIds.length;
 };
+
+/** Marks claims paid by a full & final settlement. Returns false if any is no longer approved. */
+export const settleClaimsInSettlement = async (tx: Tx, organizationId: string, claimIds: string[]) => {
+  if (claimIds.length === 0) return true;
+  const settled = await tx
+    .update(claims)
+    .set({ status: "paid", paidAt: new Date(), paymentNote: "Paid in full & final settlement", updatedAt: new Date() })
+    .where(and(eq(claims.organizationId, organizationId), inArray(claims.id, claimIds), eq(claims.status, "approved")))
+    .returning({ id: claims.id });
+  return settled.length === claimIds.length;
+};
+
+/** Approved claims an employee has not been paid for yet. */
+export const loadUnpaidClaims = (organizationId: string, membershipId: string) =>
+  db
+    .select({ id: claims.id, category: claims.category, amount: claims.amount, expenseDate: claims.expenseDate })
+    .from(claims)
+    .where(and(eq(claims.organizationId, organizationId), eq(claims.userOrganizationId, membershipId), eq(claims.status, "approved")));

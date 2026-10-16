@@ -26,14 +26,16 @@ const envSchema = z.object({
   R2_ACCESS_KEY_ID: z.string().optional(),
   R2_SECRET_ACCESS_KEY: z.string().optional(),
   R2_BUCKET: z.string().optional(),
-  AISENSY_API_KEY: z.string().optional(),
-  AISENSY_INVOICE_CAMPAIGN_NAME: z.string().optional(),
+  // Vetanly's own WhatsApp service (a separate project). Unset: messages are only logged.
+  VETANLY_WHATSAPP_URL: z.string().url().optional().or(z.literal("")),
+  VETANLY_WHATSAPP_API_KEY: z.string().optional(),
+  VETANLY_WHATSAPP_WEBHOOK_SECRET: z.string().optional(),
   PLATFORM_BILLING_NAME: z.string().optional(),
   PLATFORM_BILLING_ADDRESS: z.string().optional(),
   PLATFORM_BILLING_GSTIN: z.string().optional(),
   PLATFORM_BILLING_EMAIL: z.string().optional(),
   RESEND_API_KEY: z.string().optional(),
-  // A sender on a domain verified in Resend, e.g. "HazriPro <no-reply@yourdomain.com>".
+  // A sender on a domain verified in Resend, e.g. "Vetanly <no-reply@yourdomain.com>".
   EMAIL_FROM: z.string().optional(),
   // Public address of this API, for signed file links in local development. Defaults to http://localhost:PORT.
   API_PUBLIC_URL: z.string().optional(),

@@ -10,18 +10,22 @@ const access = (now: string, paidUntil: string | null = null, subscriptionStatus
 describe("computeAccess", () => {
   test("trial counts down to its end", () => {
     expect(access("2026-10-14T09:00:00Z")).toMatchObject({ state: "trial", daysLeft: 14 });
-    expect(access("2026-10-28T08:00:00Z")).toMatchObject({ state: "trial", daysLeft: 1 });
+    // The next afternoon, about 13.2 days remain: 13 calendar days, not 14.
+    expect(access("2026-10-15T04:16:00Z")).toMatchObject({ state: "trial", daysLeft: 13 });
+    // Late the evening before it ends (India time), one day left; on the last day, "ends today".
+    expect(access("2026-10-27T17:00:00Z")).toMatchObject({ state: "trial", daysLeft: 1 });
+    expect(access("2026-10-28T08:00:00Z")).toMatchObject({ state: "trial", daysLeft: 0 });
   });
 
   test("grace lasts 7 days after the trial, then read-only", () => {
     expect(access("2026-10-28T10:00:00Z")).toMatchObject({ state: "grace", daysLeft: 7 });
-    expect(access("2026-11-04T08:59:00Z")).toMatchObject({ state: "grace", daysLeft: 1 });
+    expect(access("2026-11-04T08:59:00Z")).toMatchObject({ state: "grace", daysLeft: 0 });
     expect(access("2026-11-04T09:01:00Z")).toMatchObject({ state: "read_only", daysLeft: 0 });
   });
 
   test("a paid day lasts until midnight India time", () => {
     // 2026-11-30 23:59 IST is 18:29 UTC.
-    expect(access("2026-11-30T18:00:00Z", "2026-11-30", "active")).toMatchObject({ state: "paid", daysLeft: 1 });
+    expect(access("2026-11-30T18:00:00Z", "2026-11-30", "active")).toMatchObject({ state: "paid", daysLeft: 0 });
     expect(access("2026-11-30T18:31:00Z", "2026-11-30", "active").state).toBe("grace");
   });
 

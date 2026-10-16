@@ -1,4 +1,4 @@
-import { and, desc, eq, gte, lte, type SQL } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, lte, type SQL } from "drizzle-orm";
 import type { z } from "zod";
 
 import db from "@/utils/db";
@@ -11,6 +11,7 @@ import {
 } from "@/drizzle/schema";
 import {
   ALL_ROLES,
+  canManageMember,
   getEmployeeMembership,
   PEOPLE_MANAGER_ROLES,
   requireRole,
@@ -34,6 +35,7 @@ const selectRequests = (where: SQL | undefined) =>
       id: requests.id,
       employeeId: userOrganizationsTable.userId,
       employeeRole: userOrganizationsTable.role,
+      employeeBranchId: userOrganizationsTable.branchId,
       fname: usersTable.fname,
       lname: usersTable.lname,
       date: requests.date,
@@ -161,6 +163,9 @@ export const listRegularizations = async (
   if (access.data.role === UserRole.HR && query.mine !== "true") {
     conditions.push(eq(userOrganizationsTable.role, UserRole.EMPLOYEE));
   }
+  if (isManager && query.mine !== "true" && access.data.branchIds) {
+    conditions.push(inArray(userOrganizationsTable.branchId, access.data.branchIds));
+  }
   if (query.status) conditions.push(eq(requests.status, query.status));
 
   const rows = await selectRequests(and(...conditions))
@@ -186,9 +191,9 @@ export const updateRegularizationStatus = async (
   const isOwnCancel = input.status === "cancelled" && isOwn;
 
   if (
-    access.data.role === UserRole.HR &&
-    current.employeeRole !== UserRole.EMPLOYEE &&
-    !isOwnCancel
+    isManager &&
+    !isOwnCancel &&
+    !canManageMember(access.data, { role: current.employeeRole, branchId: current.employeeBranchId })
   ) {
     return fail("forbidden");
   }

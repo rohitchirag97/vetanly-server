@@ -36,7 +36,7 @@ const GENESIS_HASH = "0".repeat(64);
 type PlatformTransaction = Parameters<Parameters<typeof db.transaction>[0]>[0];
 
 const appendPlatformAudit = async (tx: PlatformTransaction, entry: PlatformAuditInput) => {
-  await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext('hazripro-platform-audit'))`);
+  await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext('vetanly-platform-audit'))`);
   const [last] = await tx
     .select({ hash: platformAuditLogsTable.hash, createdAt: platformAuditLogsTable.createdAt })
     .from(platformAuditLogsTable)

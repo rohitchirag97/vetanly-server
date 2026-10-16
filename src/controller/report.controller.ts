@@ -3,6 +3,7 @@ import { buildReport } from "@/services/report.services";
 import { buildPfEcr } from "@/services/statutory-report.services";
 import { fail, respond } from "@/utils/result";
 import { buildPdf, buildXlsx } from "@/services/report-render";
+import { toCsv } from "@/services/register-calc";
 import { withOrganization, withQuery } from "@/utils/controller";
 import { reportQuerySchema } from "@/validator/report.validator";
 
@@ -26,6 +27,17 @@ export const downloadReportController = withOrganization((c, { organizationId, u
     }
     const report = await buildReport(organizationId, userId, query);
     if (!report.ok) return respond(c, report, "");
+    if (query.format === "csv") {
+      // The bank upload: column headers and one line per transfer, no titles or totals.
+      const csv = toCsv(report.data.columns.map((column) => column.header), report.data.rows);
+      return new Response(csv, {
+        headers: {
+          "Content-Type": "text/csv; charset=utf-8",
+          "Content-Disposition": `attachment; filename="${report.data.fileName.replace(/[^\w.-]/g, "_")}.csv"`,
+          "Cache-Control": "no-store",
+        },
+      });
+    }
 
     const body = query.format === "xlsx" ? await buildXlsx(report.data) : await buildPdf(report.data);
     const fileName = `${report.data.fileName}.${query.format}`.replace(/[^\w.-]/g, "_");

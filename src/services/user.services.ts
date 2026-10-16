@@ -3,6 +3,8 @@ import { and, eq, inArray, ne, or } from "drizzle-orm";
 
 import db from "@/utils/db";
 import {
+  assetsTable,
+  branchesTable,
   organizationsTable,
   UserRole,
   userOrganizationsTable,
@@ -15,7 +17,7 @@ import type {
   CreateUserInput,
   UpdateUserInput,
 } from "@/types/user.types";
-import { MANAGER_ROLES, PEOPLE_MANAGER_ROLES, requireRole } from "@/services/access.services";
+import { branchCondition, branchScopeOf, canManageMember, PEOPLE_MANAGER_ROLES, requireRole } from "@/services/access.services";
 import { fail, isUniqueViolation, ok, type ServiceResult } from "@/utils/result";
 
 export const createUser: (user: CreateUserInput) => Promise<User> = async (
@@ -117,7 +119,7 @@ export const linkPhone = (userId: string, phone: string) =>
     userId,
     "phone",
     phone,
-    "This number already belongs to another HazriPro account. Sign in with that number and link Google from there.",
+    "This number already belongs to another Vetanly account. Sign in with that number and link Google from there.",
   );
 
 /** Call only with an email Google has verified for this user. */
@@ -126,12 +128,13 @@ export const linkGoogleEmail = (userId: string, email: string) =>
     userId,
     "email",
     email,
-    "This Google account already belongs to another HazriPro account. Sign in with Google and link your phone from there.",
+    "This Google account already belongs to another Vetanly account. Sign in with Google and link your phone from there.",
   );
 
 type CreateEmployeeInput = CreateUserInput & {
   organizationId: string;
   role: UserRole.ADMIN | UserRole.HR | UserRole.EMPLOYEE;
+  branchId?: string;
 };
 
 type CreateEmployeeResult =
@@ -144,7 +147,7 @@ type CreateEmployeeResult =
 type ListEmployeesResult =
   | {
       status: "ok";
-      employees: Array<User & { role: string; isActive: boolean }>;
+      employees: Array<User & { role: string; isActive: boolean; branchId: string | null; branchName: string | null }>;
     }
   | { status: "organization-not-found" }
   | { status: "forbidden" };
@@ -160,13 +163,17 @@ type EmployeeMembershipResult =
   | { status: "updated"; isActive: boolean }
   | { status: "removed" }
   | { status: "cannot-remove-super-admin" }
+  | { status: "holds-assets"; count: number }
   | { status: "organization-not-found" }
   | { status: "forbidden" }
   | { status: "employee-not-found" }
   | { status: "cannot-manage-super-admin" };
 
-const isOrganizationAdmin = (role: string | undefined) =>
-  MANAGER_ROLES.includes(role ?? "");
+/** HR only manages plain employees; a branch-limited manager only people in their branches. */
+const managesMember = async (
+  requester: { id: string; role: string },
+  target: { role: string; branchId: string | null },
+) => canManageMember({ role: requester.role, branchIds: await branchScopeOf(requester.id, requester.role) }, target);
 
 export const setEmployeeMembershipActive = async (
   employeeId: string,
@@ -185,7 +192,7 @@ export const setEmployeeMembershipActive = async (
     if (!organization) return { status: "organization-not-found" };
 
     const [requesterMembership] = await trx
-      .select({ role: userOrganizationsTable.role })
+      .select({ id: userOrganizationsTable.id, role: userOrganizationsTable.role })
       .from(userOrganizationsTable)
       .where(
         and(
@@ -204,6 +211,7 @@ export const setEmployeeMembershipActive = async (
       .select({
         id: userOrganizationsTable.id,
         role: userOrganizationsTable.role,
+        branchId: userOrganizationsTable.branchId,
       })
       .from(userOrganizationsTable)
       .where(
@@ -218,7 +226,7 @@ export const setEmployeeMembershipActive = async (
     if (employeeMembership.role === UserRole.SUPER_ADMIN) {
       return { status: "cannot-manage-super-admin" };
     }
-    if (requesterMembership?.role === UserRole.HR && employeeMembership.role !== UserRole.EMPLOYEE) {
+    if (!(await managesMember(requesterMembership!, employeeMembership))) {
       return { status: "forbidden" };
     }
 
@@ -254,7 +262,7 @@ export const removeEmployeeFromOrganization = async (
     if (!organization) return { status: "organization-not-found" };
 
     const [requesterMembership] = await trx
-      .select({ role: userOrganizationsTable.role })
+      .select({ id: userOrganizationsTable.id, role: userOrganizationsTable.role })
       .from(userOrganizationsTable)
       .where(
         and(
@@ -269,6 +277,7 @@ export const removeEmployeeFromOrganization = async (
       .select({
         id: userOrganizationsTable.id,
         role: userOrganizationsTable.role,
+        branchId: userOrganizationsTable.branchId,
       })
       .from(userOrganizationsTable)
       .where(
@@ -284,10 +293,19 @@ export const removeEmployeeFromOrganization = async (
     if (employeeMembership.role === UserRole.SUPER_ADMIN) {
       return { status: "cannot-remove-super-admin" };
     }
-    const isHrManagingEmployee = requesterMembership?.role === UserRole.HR && employeeMembership.role === UserRole.EMPLOYEE;
-    if (!isSelfRemoval && !isOrganizationAdmin(requesterMembership?.role) && !isHrManagingEmployee) {
+    const canManage =
+      !!requesterMembership &&
+      PEOPLE_MANAGER_ROLES.includes(requesterMembership.role) &&
+      (await managesMember(requesterMembership, employeeMembership));
+    if (!isSelfRemoval && !canManage) {
       return { status: "forbidden" };
     }
+    // Removing the membership would orphan the handover records; assets must come back first.
+    const held = await trx
+      .select({ id: assetsTable.id })
+      .from(assetsTable)
+      .where(eq(assetsTable.holderMembershipId, employeeMembership.id));
+    if (held.length) return { status: "holds-assets", count: held.length };
 
     await trx
       .delete(userOrganizationsTable)
@@ -316,7 +334,7 @@ export const updateEmployeeForOrganization = async (
     if (!organization) return { status: "organization-not-found" };
 
     const [requesterMembership] = await trx
-      .select({ role: userOrganizationsTable.role })
+      .select({ id: userOrganizationsTable.id, role: userOrganizationsTable.role })
       .from(userOrganizationsTable)
       .where(
         and(
@@ -338,6 +356,7 @@ export const updateEmployeeForOrganization = async (
       .select({
         id: userOrganizationsTable.id,
         role: userOrganizationsTable.role,
+        branchId: userOrganizationsTable.branchId,
       })
       .from(userOrganizationsTable)
       .where(
@@ -353,8 +372,8 @@ export const updateEmployeeForOrganization = async (
       return { status: "cannot-update-super-admin" };
     }
     if (
-      requesterMembership.role === UserRole.HR &&
-      (employeeMembership.role !== UserRole.EMPLOYEE || input.role !== UserRole.EMPLOYEE)
+      (requesterMembership.role === UserRole.HR && input.role !== UserRole.EMPLOYEE) ||
+      !(await managesMember(requesterMembership, employeeMembership))
     ) {
       return { status: "forbidden" };
     }
@@ -389,7 +408,7 @@ export const listEmployeesForOrganization = async (
     if (!organization) return { status: "organization-not-found" };
 
     const [membership] = await trx
-      .select({ role: userOrganizationsTable.role })
+      .select({ id: userOrganizationsTable.id, role: userOrganizationsTable.role })
       .from(userOrganizationsTable)
       .where(
         and(
@@ -415,13 +434,17 @@ export const listEmployeesForOrganization = async (
         phone: usersTable.phone,
         role: userOrganizationsTable.role,
         isActive: userOrganizationsTable.isActive,
+        branchId: userOrganizationsTable.branchId,
+        branchName: branchesTable.name,
       })
       .from(userOrganizationsTable)
       .innerJoin(usersTable, eq(userOrganizationsTable.userId, usersTable.id))
+      .leftJoin(branchesTable, eq(branchesTable.id, userOrganizationsTable.branchId))
       .where(
         and(
           eq(userOrganizationsTable.organizationId, organizationId),
           membership.role === UserRole.HR ? eq(userOrganizationsTable.role, UserRole.EMPLOYEE) : undefined,
+          branchCondition({ branchIds: await branchScopeOf(membership.id, membership.role) }),
           or(
             ne(userOrganizationsTable.role, UserRole.SUPER_ADMIN),
             eq(userOrganizationsTable.includeInPayroll, true),
@@ -447,7 +470,7 @@ export const createEmployeeForOrganization = async (
     if (!organization) return { status: "organization-not-found" };
 
     const [membership] = await trx
-      .select({ role: userOrganizationsTable.role })
+      .select({ id: userOrganizationsTable.id, role: userOrganizationsTable.role })
       .from(userOrganizationsTable)
       .where(
         and(
@@ -464,6 +487,19 @@ export const createEmployeeForOrganization = async (
       (membership.role === UserRole.HR && input.role !== UserRole.EMPLOYEE)
     ) {
       return { status: "forbidden" };
+    }
+
+    // A branch admin adds people to their own branch (their only one when they don't say which).
+    const scope = await branchScopeOf(membership.id, membership.role);
+    const branchId = input.branchId ?? (scope?.length === 1 ? scope[0]! : null);
+    if (scope && !(branchId && scope.includes(branchId))) return { status: "forbidden" };
+    if (branchId) {
+      const [branch] = await trx
+        .select({ id: branchesTable.id })
+        .from(branchesTable)
+        .where(and(eq(branchesTable.id, branchId), eq(branchesTable.organizationId, input.organizationId), eq(branchesTable.isActive, true)))
+        .limit(1);
+      if (!branch) return { status: "forbidden" };
     }
 
     const [insertedEmployee] = await trx
@@ -513,7 +549,8 @@ export const createEmployeeForOrganization = async (
       }
       await trx
         .update(userOrganizationsTable)
-        .set({ role: input.role, isActive: true })
+        // Re-hired into the branch chosen now (a former employee may come back to another branch).
+        .set({ role: input.role, isActive: true, ...(branchId ? { branchId } : {}) })
         .where(eq(userOrganizationsTable.id, existingMembership.id));
       return { status: "added", employee };
     }
@@ -522,6 +559,7 @@ export const createEmployeeForOrganization = async (
       organizationId: input.organizationId,
       userId: employee.id,
       role: input.role,
+      branchId,
     });
 
     return {
@@ -578,7 +616,7 @@ export const updateUser: (
 
 /**
  * What importing each phone would do, decided by the same rules as createEmployeeForOrganization:
- * - new: no HazriPro account yet; one is created.
+ * - new: no Vetanly account yet; one is created.
  * - existing-user: has an account (another organization or sign-up); added to this one.
  * - inactive-member: was in this organization and is reactivated.
  * - member: already active here; importing again would do nothing.
