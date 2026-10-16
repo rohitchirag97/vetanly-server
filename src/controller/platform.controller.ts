@@ -1,6 +1,6 @@
 import { randomInt } from "node:crypto";
 import type { Context } from "hono";
-import { getConnInfo } from "hono/bun";
+import { clientIp } from "@/middleware/audit.middleware";
 
 import {
   addPlatformOrganizationNote,
@@ -62,12 +62,7 @@ type AuthenticatedUser = { id: string; fname: string; lname: string; phone: stri
 
 export const getActor = (c: Context): PlatformActor => {
   const user = c.get("user") as AuthenticatedUser;
-  let ipAddress: string | null = null;
-  try {
-    ipAddress = getConnInfo(c).remote.address ?? null;
-  } catch {
-    ipAddress = c.req.header("x-forwarded-for")?.split(",")[0]?.trim() ?? null;
-  }
+  const ipAddress = clientIp(c);
   return {
     id: user.id,
     name: `${user.fname} ${user.lname}`.trim(),

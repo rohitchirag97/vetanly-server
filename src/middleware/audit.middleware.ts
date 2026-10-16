@@ -13,12 +13,21 @@ const READ_ONLY_POSTS = new Set([`${API_PREFIX}/employee/bulk/check`]);
 
 type Body = Record<string, unknown>;
 
+// Loopback and private ranges: in production the only peer there is our own Caddy proxy.
+const PRIVATE_PEER = /^(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|::1$|::ffff:(127|10|192\.168|172\.(1[6-9]|2\d|3[01]))\.|f[cd])/i;
+
+/** The visitor's IP. Behind the proxy every socket is the proxy's, so read the address it forwards. */
 export const clientIp = (c: Context): string | null => {
+  let peer: string | null = null;
   try {
-    return getConnInfo(c).remote.address ?? null;
+    peer = getConnInfo(c).remote.address ?? null;
   } catch {
-    return c.req.header("x-forwarded-for")?.split(",")[0]?.trim() ?? null;
+    // No socket info (e.g. tests): only the header is available.
   }
+  const forwarded = c.req.header("x-forwarded-for")?.split(",")[0]?.trim() || null;
+  // Caddy overwrites X-Forwarded-For from the internet, so it is trusted only when the proxy sent it.
+  if (forwarded && (!peer || PRIVATE_PEER.test(peer))) return forwarded;
+  return peer;
 };
 
 // Hono caches the parsed body, so reading it here does not disturb the handler.
