@@ -11,7 +11,7 @@ COPY package.json bun.lock ./
 RUN bun install --frozen-lockfile
 
 # drizzle-kit runs on Node: it loads node:sqlite, which Bun does not provide.
-FROM node:24-alpine AS migrate
+FROM node:24.22.1-alpine AS migrate
 WORKDIR /app
 COPY --from=migrate-deps /app/node_modules ./node_modules
 COPY package.json drizzle.config.ts tsconfig.json ./
