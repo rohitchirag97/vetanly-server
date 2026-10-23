@@ -1,4 +1,4 @@
-import { and, eq, inArray, isNull, ne, or, sql } from "drizzle-orm";
+import { and, eq, inArray, isNull, or, sql } from "drizzle-orm";
 
 import db from "@/utils/db";
 import {
@@ -7,9 +7,8 @@ import {
   platformPlansTable,
   platformSubscriptionsTable,
   userOrganizationsTable,
-  UserRole,
 } from "@/drizzle/schema";
-import { ALL_ROLES, OWNER_ROLES, requireRole } from "@/services/access.services";
+import { ALL_ROLES, countsAsEmployee, OWNER_ROLES, requireRole } from "@/services/access.services";
 import { fail, ok, type ServiceResult } from "@/utils/result";
 
 /**
@@ -132,7 +131,7 @@ export const requireFullAccess = async (organizationId: string): Promise<Service
   return ok(null);
 };
 
-/** Members billed per head: everyone active except the owner, unless the owner is on payroll. Mirrors payroll. */
+/** Members billed per head: everyone active who counts as an employee. Mirrors payroll. */
 export const countBillableEmployees = async (organizationId: string) => {
   const [row] = await db
     .select({ count: sql<number>`count(*)::int` })
@@ -141,10 +140,7 @@ export const countBillableEmployees = async (organizationId: string) => {
       and(
         eq(userOrganizationsTable.organizationId, organizationId),
         eq(userOrganizationsTable.isActive, true),
-        or(
-          ne(userOrganizationsTable.role, UserRole.SUPER_ADMIN),
-          eq(userOrganizationsTable.includeInPayroll, true),
-        ),
+        countsAsEmployee(),
       ),
     );
   return Number(row?.count ?? 0);

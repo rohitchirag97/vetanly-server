@@ -31,7 +31,7 @@ export const listEmployeesController = async (c: Context): Promise<Response> => 
     return sendResponse(c, "error", "Organization is required", null, 400);
   }
 
-  const result = await listEmployeesForOrganization(organizationId, user.id);
+  const result = await listEmployeesForOrganization(organizationId, user.id, c.req.query("all") === "true");
   if (result.status === "organization-not-found") {
     return sendResponse(c, "error", "Organization not found", null, 404);
   }

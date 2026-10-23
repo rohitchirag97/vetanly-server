@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gte, inArray, isNull, lte, ne, or, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, isNull, lte, or, type SQL } from "drizzle-orm";
 import type { z } from "zod";
 
 import db from "@/utils/db";
@@ -14,7 +14,7 @@ import {
   type ShiftRotationStep,
   type ShiftSwapStatus,
 } from "@/drizzle/schema";
-import { ALL_ROLES, branchCondition, canManageMember, PEOPLE_MANAGER_ROLES, requireRole, type ActiveMembership } from "@/services/access.services";
+import { ALL_ROLES, branchCondition, canManageMember, countsAsEmployee, PEOPLE_MANAGER_ROLES, requireRole, type ActiveMembership } from "@/services/access.services";
 import { notify, peopleManagerIds } from "@/services/notification.services";
 import { addDays, cycleLength, eachDay, resolveRosterDay, type RosterAssignment, type RosterSource } from "@/services/roster-calc";
 import { fail, ok, type ServiceResult } from "@/utils/result";
@@ -283,8 +283,8 @@ export const getRosterGrid = async (
   if (access.data.role === UserRole.HR) conditions.push(eq(memberships.role, UserRole.EMPLOYEE));
   const branches = branchCondition(access.data);
   if (branches) conditions.push(branches);
-  // The owner appears only when they are on payroll as an employee, as in payroll itself.
-  conditions.push(or(ne(memberships.role, UserRole.SUPER_ADMIN), eq(memberships.includeInPayroll, true))!);
+  // The owner and admins appear only when they are on payroll as employees, as in payroll itself.
+  conditions.push(countsAsEmployee());
   const people = await db
     .select({
       membershipId: memberships.id,

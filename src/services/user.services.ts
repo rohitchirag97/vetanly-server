@@ -17,7 +17,7 @@ import type {
   CreateUserInput,
   UpdateUserInput,
 } from "@/types/user.types";
-import { branchCondition, branchScopeOf, canManageMember, PEOPLE_MANAGER_ROLES, requireRole } from "@/services/access.services";
+import { branchCondition, branchScopeOf, canManageMember, countsAsEmployee, PEOPLE_MANAGER_ROLES, requireRole } from "@/services/access.services";
 import { fail, isForeignKeyViolation, isUniqueViolation, ok, type ServiceResult } from "@/utils/result";
 
 export const createUser: (user: CreateUserInput) => Promise<User> = async (
@@ -135,6 +135,8 @@ type CreateEmployeeInput = CreateUserInput & {
   organizationId: string;
   role: UserRole.ADMIN | UserRole.HR | UserRole.EMPLOYEE;
   branchId?: string;
+  /** Admins only: false gives app access without counting them as an employee. Others always count. */
+  includeInPayroll?: boolean;
 };
 
 type CreateEmployeeResult =
@@ -329,6 +331,7 @@ export const updateEmployeeForOrganization = async (
     fname: string;
     lname: string;
     role: UserRole.ADMIN | UserRole.HR | UserRole.EMPLOYEE;
+    includeInPayroll?: boolean;
   },
   requesterId: string,
 ): Promise<UpdateEmployeeResult> =>
@@ -396,7 +399,7 @@ export const updateEmployeeForOrganization = async (
 
     await trx
       .update(userOrganizationsTable)
-      .set({ role: input.role })
+      .set({ role: input.role, ...(input.includeInPayroll === undefined ? {} : { includeInPayroll: input.includeInPayroll }) })
       .where(eq(userOrganizationsTable.id, employeeMembership.id));
 
     return { status: "updated", employee: { ...employee, role: input.role } };
@@ -405,6 +408,8 @@ export const updateEmployeeForOrganization = async (
 export const listEmployeesForOrganization = async (
   organizationId: string,
   requesterId: string,
+  /** Also return admins who only have app access, for managing them. */
+  withAppAccessOnly = false,
 ): Promise<ListEmployeesResult> =>
   db.transaction(async (trx) => {
     const [organization] = await trx
@@ -444,6 +449,7 @@ export const listEmployeesForOrganization = async (
         isActive: userOrganizationsTable.isActive,
         branchId: userOrganizationsTable.branchId,
         branchName: branchesTable.name,
+        includeInPayroll: userOrganizationsTable.includeInPayroll,
       })
       .from(userOrganizationsTable)
       .innerJoin(usersTable, eq(userOrganizationsTable.userId, usersTable.id))
@@ -453,10 +459,9 @@ export const listEmployeesForOrganization = async (
           eq(userOrganizationsTable.organizationId, organizationId),
           membership.role === UserRole.HR ? eq(userOrganizationsTable.role, UserRole.EMPLOYEE) : undefined,
           branchCondition({ branchIds: await branchScopeOf(membership.id, membership.role) }),
-          or(
-            ne(userOrganizationsTable.role, UserRole.SUPER_ADMIN),
-            eq(userOrganizationsTable.includeInPayroll, true),
-          ),
+          withAppAccessOnly
+            ? or(ne(userOrganizationsTable.role, UserRole.SUPER_ADMIN), eq(userOrganizationsTable.includeInPayroll, true))
+            : countsAsEmployee(),
         ),
       )
       .orderBy(usersTable.fname, usersTable.lname);
@@ -558,7 +563,7 @@ export const createEmployeeForOrganization = async (
       await trx
         .update(userOrganizationsTable)
         // Re-hired into the branch chosen now (a former employee may come back to another branch).
-        .set({ role: input.role, isActive: true, ...(branchId ? { branchId } : {}) })
+        .set({ role: input.role, isActive: true, includeInPayroll: input.includeInPayroll ?? true, ...(branchId ? { branchId } : {}) })
         .where(eq(userOrganizationsTable.id, existingMembership.id));
       return { status: "added", employee };
     }
@@ -568,6 +573,7 @@ export const createEmployeeForOrganization = async (
       userId: employee.id,
       role: input.role,
       branchId,
+      includeInPayroll: input.includeInPayroll ?? true,
     });
 
     return {

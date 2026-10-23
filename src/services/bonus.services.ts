@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, inArray, isNull, gt, gte, lte, ne, or } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, gt, gte, lte } from "drizzle-orm";
 import type { z } from "zod";
 
 import db from "@/utils/db";
@@ -11,10 +11,9 @@ import {
   userOrganizationsTable as memberships,
   usersTable,
   departmentsTable,
-  UserRole,
   type CompensationType,
 } from "@/drizzle/schema";
-import { MANAGER_ROLES, requireRole } from "@/services/access.services";
+import { countsAsEmployee, MANAGER_ROLES, requireRole } from "@/services/access.services";
 import { requireFullAccess } from "@/services/billing-access.services";
 import { computeBonus, isDearnessAllowance, type BonusMonth } from "@/services/bonus-calc";
 import { notify } from "@/services/notification.services";
@@ -382,7 +381,7 @@ export const gratuityLiability = async (organizationId: string, requesterId: str
       and(
         eq(memberships.organizationId, organizationId),
         eq(memberships.isActive, true),
-        or(ne(memberships.role, UserRole.SUPER_ADMIN), eq(memberships.includeInPayroll, true)),
+        countsAsEmployee(),
       ),
     );
 

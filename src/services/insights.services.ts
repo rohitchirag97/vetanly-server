@@ -87,7 +87,7 @@ const scopedMembers = async (organizationId: string, access: ActiveMembership) =
     )
     .where(eq(memberships.organizationId, organizationId));
   return rows
-    .filter((row) => (row.role !== UserRole.SUPER_ADMIN || row.includeInPayroll) && canManageMember(access, row))
+    .filter((row) => ((row.role !== UserRole.SUPER_ADMIN && row.role !== UserRole.ADMIN) || row.includeInPayroll) && canManageMember(access, row))
     .map((row) => {
       const deactivated = !row.isActive && row.deactivatedAt ? new Date(row.deactivatedAt.getTime() + IST_OFFSET_MS).toISOString().slice(0, 10) : null;
       return {

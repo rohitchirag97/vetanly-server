@@ -10,6 +10,7 @@ export const createEmployeeSchema = z.object({
   role: z.enum([UserRole.ADMIN, UserRole.HR, UserRole.EMPLOYEE]),
   organizationId: z.uuid(),
   branchId: z.uuid().optional(),
+  includeInPayroll: z.boolean().optional(),
 });
 
 export const bulkCreateEmployeesSchema = z.object({
@@ -40,6 +41,7 @@ export const updateEmployeeSchema = z.object({
   fname: z.string().trim().min(1, "First name is required").max(52),
   lname: z.string().trim().min(1, "Last name is required").max(52),
   role: z.enum([UserRole.ADMIN, UserRole.HR, UserRole.EMPLOYEE]),
+  includeInPayroll: z.boolean().optional(),
 });
 
 export const updateEmployeeStatusSchema = z

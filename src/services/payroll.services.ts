@@ -1,4 +1,4 @@
-import { and, desc, eq, gte, inArray, lte, ne, or } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, lte } from "drizzle-orm";
 import type { z } from "zod";
 
 import db from "@/utils/db";
@@ -17,10 +17,9 @@ import {
   payrollRunsTable as runs,
   shiftsTable,
   userOrganizationsTable as memberships,
-  UserRole,
   usersTable,
 } from "@/drizzle/schema";
-import { ALL_ROLES, isOrganizationManager, MANAGER_ROLES, requireRole } from "@/services/access.services";
+import { ALL_ROLES, countsAsEmployee, isOrganizationManager, MANAGER_ROLES, requireRole } from "@/services/access.services";
 import { computeDailyAttendance } from "@/services/attendance.services";
 import { notify } from "@/services/notification.services";
 import { queueDelivery, sendableChannels } from "@/services/messaging.services";
@@ -236,10 +235,7 @@ export const buildPayrollItems = async (
         eq(memberships.organizationId, organizationId),
         options.includeInactive ? undefined : eq(memberships.isActive, true),
         options.membershipIds ? inArray(memberships.id, options.membershipIds) : undefined,
-        or(
-          ne(memberships.role, UserRole.SUPER_ADMIN),
-          eq(memberships.includeInPayroll, true),
-        ),
+        countsAsEmployee(),
       ),
     );
 

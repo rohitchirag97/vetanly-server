@@ -1,4 +1,4 @@
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, notInArray, or } from "drizzle-orm";
 
 import db from "@/utils/db";
 import {
@@ -56,6 +56,13 @@ export const canManageMember = (
 /** Narrows a members query to the manager's branches; nothing for whole-organization managers. */
 export const branchCondition = (manager: { branchIds: string[] | null }) =>
   manager.branchIds ? inArray(userOrganizationsTable.branchId, manager.branchIds) : undefined;
+
+/** Counted as an employee (lists, payroll, billing): everyone but the owner and admins, unless they are on payroll. */
+export const countsAsEmployee = () =>
+  or(
+    notInArray(userOrganizationsTable.role, [UserRole.SUPER_ADMIN, UserRole.ADMIN]),
+    eq(userOrganizationsTable.includeInPayroll, true),
+  )!;
 
 export const getActiveMembership = async (
   organizationId: string,
