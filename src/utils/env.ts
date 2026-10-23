@@ -43,6 +43,10 @@ const envSchema = z.object({
   API_PUBLIC_URL: z.string().optional(),
   CORS_ORIGIN: z.string().optional(),
   GOOGLE_CLIENT_ID: z.string().optional(),
+  // Google Play review: fixed, reusable pairing and manager codes for one demo kiosk. Unset outside a review.
+  KIOSK_REVIEW_KIOSK_ID: z.string().uuid().optional().or(z.literal("")),
+  KIOSK_REVIEW_PAIRING_CODE: z.string().regex(/^\d{6}$/, "KIOSK_REVIEW_PAIRING_CODE must be 6 digits").optional().or(z.literal("")),
+  KIOSK_REVIEW_ENROLLMENT_CODE: z.string().regex(/^\d{6}$/, "KIOSK_REVIEW_ENROLLMENT_CODE must be 6 digits").optional().or(z.literal("")),
 });
 
 export const env = envSchema.parse(process.env);

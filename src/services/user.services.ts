@@ -18,7 +18,7 @@ import type {
   UpdateUserInput,
 } from "@/types/user.types";
 import { branchCondition, branchScopeOf, canManageMember, PEOPLE_MANAGER_ROLES, requireRole } from "@/services/access.services";
-import { fail, isUniqueViolation, ok, type ServiceResult } from "@/utils/result";
+import { fail, isForeignKeyViolation, isUniqueViolation, ok, type ServiceResult } from "@/utils/result";
 
 export const createUser: (user: CreateUserInput) => Promise<User> = async (
   user: CreateUserInput,
@@ -164,6 +164,7 @@ type EmployeeMembershipResult =
   | { status: "removed" }
   | { status: "cannot-remove-super-admin" }
   | { status: "holds-assets"; count: number }
+  | { status: "has-history" }
   | { status: "organization-not-found" }
   | { status: "forbidden" }
   | { status: "employee-not-found" }
@@ -307,9 +308,16 @@ export const removeEmployeeFromOrganization = async (
       .where(eq(assetsTable.holderMembershipId, employeeMembership.id));
     if (held.length) return { status: "holds-assets", count: held.length };
 
-    await trx
-      .delete(userOrganizationsTable)
-      .where(eq(userOrganizationsTable.id, employeeMembership.id));
+    // Attendance, leave, payroll etc. reference the membership; deleting would wipe that history, so refuse.
+    // Savepoint so the FK failure doesn't abort the outer transaction.
+    try {
+      await trx.transaction((sp) =>
+        sp.delete(userOrganizationsTable).where(eq(userOrganizationsTable.id, employeeMembership.id)),
+      );
+    } catch (error) {
+      if (isForeignKeyViolation(error)) return { status: "has-history" };
+      throw error;
+    }
 
     return { status: "removed" };
   });

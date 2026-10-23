@@ -5,6 +5,8 @@ import type { z } from "zod";
 import db from "@/utils/db";
 import { branchesTable, kioskDevicesTable, organizationsTable } from "@/drizzle/schema";
 import { MANAGER_ROLES, requireRole } from "@/services/access.services";
+import { reviewKioskFor } from "@/services/kiosk-review";
+import { env } from "@/utils/env";
 import { fail, isUniqueViolation, ok, type ServiceResult } from "@/utils/result";
 import { del, get, getAndDelete, set, setIfAbsent } from "@/utils/redis";
 import type {
@@ -164,6 +166,11 @@ const ENROLLMENT_SESSION_SECONDS = 15 * 60;
 type KioskCodeKind = "pair" | "enroll";
 const codeKey = (kind: KioskCodeKind, code: string) => `kiosk-${kind}:${code}`;
 const enrollmentSessionKey = (kioskId: string) => `kiosk-enroll-session:${kioskId}`;
+const reviewConfig = {
+  kioskId: env.KIOSK_REVIEW_KIOSK_ID,
+  pairingCode: env.KIOSK_REVIEW_PAIRING_CODE,
+  enrollmentCode: env.KIOSK_REVIEW_ENROLLMENT_CODE,
+};
 
 /**
  * A short-lived 6-digit code a manager reads off the dashboard and types into the kiosk:
@@ -193,6 +200,8 @@ export const createKioskCode = async (
   // Codes are global, so retry on the rare collision with another live code.
   for (let attempt = 0; attempt < 5; attempt++) {
     const code = randomInt(0, 1_000_000).toString().padStart(6, "0");
+    // Never hand out a reserved review code: the review kiosk would claim it instead.
+    if (reviewKioskFor(reviewConfig, kind, code)) continue;
     if (await setIfAbsent(codeKey(kind, code), kiosk.id, KIOSK_CODE_TTL_SECONDS)) {
       return ok({ code, expiresInSeconds: KIOSK_CODE_TTL_SECONDS });
     }
@@ -205,10 +214,13 @@ export const unlockEnrollment = async (
   kiosk: AuthenticatedKiosk,
   code: string,
 ): Promise<ServiceResult<{ expiresInSeconds: number }>> => {
-  const key = codeKey("enroll", code);
-  // Only consume the code when it belongs to this kiosk, so a wrong kiosk cannot burn it.
-  if ((await get(key)) !== kiosk.id) return fail("invalid", "Invalid or expired enrollment code");
-  await del(key);
+  // The review kiosk's fixed manager code is reusable and works on that kiosk only.
+  if (reviewKioskFor(reviewConfig, "enroll", code) !== kiosk.id) {
+    const key = codeKey("enroll", code);
+    // Only consume the code when it belongs to this kiosk, so a wrong kiosk cannot burn it.
+    if ((await get(key)) !== kiosk.id) return fail("invalid", "Invalid or expired enrollment code");
+    await del(key);
+  }
   await set(enrollmentSessionKey(kiosk.id), "1", ENROLLMENT_SESSION_SECONDS);
   return ok({ expiresInSeconds: ENROLLMENT_SESSION_SECONDS });
 };
@@ -220,7 +232,7 @@ export const isEnrollmentUnlocked = async (kioskId: string) =>
 export const claimPairingCode = async (
   code: string,
 ): Promise<ServiceResult<{ kioskId: string; name: string; apiKey: string }>> => {
-  const kioskId = await getAndDelete(codeKey("pair", code));
+  const kioskId = reviewKioskFor(reviewConfig, "pair", code) ?? (await getAndDelete(codeKey("pair", code)));
   if (!kioskId) return fail("invalid", "Invalid or expired pairing code");
   const apiKey = generateKey();
   const [kiosk] = await db

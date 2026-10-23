@@ -52,11 +52,14 @@ export const respond = <T>(
         statusByError[result.error],
       );
 
-export const isUniqueViolation = (error: unknown): boolean => {
+const hasPgCode = (error: unknown, code: string): boolean => {
   let current: any = error;
   while (current) {
-    if (current.code === "23505") return true;
+    if (current.code === code) return true;
     current = current.cause;
   }
   return false;
 };
+
+export const isUniqueViolation = (error: unknown): boolean => hasPgCode(error, "23505");
+export const isForeignKeyViolation = (error: unknown): boolean => hasPgCode(error, "23503");

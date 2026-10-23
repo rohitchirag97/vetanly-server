@@ -119,6 +119,15 @@ const respondToMembershipAction = (
       409,
     );
   }
+  if (result.status === "has-history") {
+    return sendResponse(
+      c,
+      "error",
+      "This person has attendance, leave or payroll records in this organization, so they can't be removed. Deactivate them instead.",
+      null,
+      409,
+    );
+  }
   if (result.status === "cannot-remove-super-admin") {
     return sendResponse(
       c,
