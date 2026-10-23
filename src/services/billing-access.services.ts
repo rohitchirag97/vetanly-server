@@ -169,7 +169,7 @@ export type BillingStatus = OrganizationAccess & {
       name: string;
       description: string | null;
       currencyCode: string;
-      billingPeriod: "monthly" | "annual";
+      billingPeriod: "monthly" | "annual" | "five_year";
       priceAmount: string;
       includedEmployees: number;
       overagePrice: string;

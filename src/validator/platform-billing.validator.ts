@@ -4,7 +4,7 @@ const planFields = {
   name: z.string().trim().min(1).max(100),
   description: z.string().trim().max(500),
   priceAmount: z.coerce.number().finite().min(0).max(1_000_000_000).multipleOf(0.01),
-  billingPeriod: z.enum(["monthly", "annual"]),
+  billingPeriod: z.enum(["monthly", "annual", "five_year"]),
   includedEmployees: z.coerce.number().int().min(0).max(1_000_000),
   overagePrice: z.coerce.number().finite().min(0).max(1_000_000_000).multipleOf(0.01),
   features: z.array(z.string().trim().min(1).max(60)).max(30),

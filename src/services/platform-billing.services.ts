@@ -20,7 +20,7 @@ type PlanInput = {
   name: string;
   description?: string;
   priceAmount: number;
-  billingPeriod: "monthly" | "annual";
+  billingPeriod: "monthly" | "annual" | "five_year";
   includedEmployees: number;
   overagePrice: number;
   features: string[];

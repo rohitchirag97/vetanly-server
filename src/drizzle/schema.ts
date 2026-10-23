@@ -205,7 +205,7 @@ export const platformAuditLogsTable = pgTable(
   ],
 );
 
-export type PlatformBillingPeriod = "monthly" | "annual";
+export type PlatformBillingPeriod = "monthly" | "annual" | "five_year";
 // public: listed on every owner's Billing page. custom: only for organizations it is offered to.
 export type PlatformPlanVisibility = "public" | "custom";
 export type PlatformSubscriptionStatus = "active" | "trial" | "past_due" | "cancelled";
