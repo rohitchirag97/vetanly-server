@@ -6,7 +6,8 @@ import { isActiveSession } from "@/services/session.services";
 import { sendResponse } from "@/utils/response";
 import { and, eq } from "drizzle-orm";
 import db from "@/utils/db";
-import { organizationsTable, platformSubscriptionsTable, userOrganizationsTable } from "@/drizzle/schema";
+import { organizationsTable, platformPlansTable, platformSubscriptionsTable, userOrganizationsTable } from "@/drizzle/schema";
+import { featureForPath, featureMissingMessage, featuresOf } from "@/services/plan-features";
 import { computeAccess, TRIAL_NOT_STARTED_MESSAGE } from "@/services/billing-access.services";
 import { readUuid } from "@/utils/request";
 
@@ -55,6 +56,7 @@ export const authenticate = async (c: Context, next: () => Promise<void>) => {
           trialEndsAt: organizationsTable.trialEndsAt,
           paidUntil: platformSubscriptionsTable.paidUntil,
           subscriptionStatus: platformSubscriptionsTable.status,
+          planFeatures: platformPlansTable.features,
         })
         .from(userOrganizationsTable)
         .innerJoin(
@@ -65,6 +67,7 @@ export const authenticate = async (c: Context, next: () => Promise<void>) => {
           platformSubscriptionsTable,
           eq(platformSubscriptionsTable.organizationId, organizationsTable.id),
         )
+        .leftJoin(platformPlansTable, eq(platformPlansTable.id, platformSubscriptionsTable.planId))
         .where(
           and(
             eq(userOrganizationsTable.organizationId, organizationId),
@@ -102,12 +105,18 @@ export const authenticate = async (c: Context, next: () => Promise<void>) => {
         );
       }
       // Until the owner starts the free trial, nothing in the workspace can be read or changed.
+      const accessState = membership ? computeAccess(membership).state : null;
       if (
         membership &&
         !TRIAL_GATE_EXEMPT.some((prefix) => c.req.path.startsWith(prefix)) &&
-        computeAccess(membership).state === "inactive"
+        accessState === "inactive"
       ) {
         return sendResponse(c, "error", TRIAL_NOT_STARTED_MESSAGE, { code: "TRIAL_NOT_STARTED" }, 402);
+      }
+      // A paid plan opens only its own features.
+      const feature = featureForPath(c.req.path.replace(/^\/api\/v1/, ""));
+      if (membership && accessState && feature && !featuresOf({ ...membership, accessState }).includes(feature)) {
+        return sendResponse(c, "error", featureMissingMessage(feature), { code: "FEATURE_NOT_IN_PLAN", feature }, 403);
       }
     }
     await next();

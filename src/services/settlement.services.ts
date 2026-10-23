@@ -19,6 +19,7 @@ import {
 } from "@/drizzle/schema";
 import { MANAGER_ROLES, requireRole } from "@/services/access.services";
 import { assetsHeldBy } from "@/services/asset.services";
+import { getOrganizationFeatures } from "@/services/billing-access.services";
 import { settleBonusesInPayroll } from "@/services/bonus.services";
 import { CATEGORY_LABELS, loadUnpaidClaims, settleClaimsInSettlement } from "@/services/expense.services";
 import { remainingPaidLeave } from "@/services/leave.services";
@@ -123,6 +124,8 @@ const computeLines = async (organizationId: string, ctx: Context, lastWorkingDay
   const lines: SettlementLine[] = [];
   const notes: string[] = [];
   let statutory = null;
+  // Gratuity, loan recovery and claim reimbursement only when the plan includes them.
+  const features = new Set(await getOrganizationFeatures(organizationId));
 
   if (inputs.salaryFrom <= lastWorkingDay) {
     const built = await buildPayrollItems(
@@ -151,7 +154,7 @@ const computeLines = async (organizationId: string, ctx: Context, lastWorkingDay
   }
 
   const gratuityInfo = gratuity({ hireDate: ctx.hireDate, lastWorkingDay, monthlyBasic: monthlyBasic(ctx) });
-  if (inputs.includeGratuity && gratuityInfo.eligible) {
+  if (features.has("bonus") && inputs.includeGratuity && gratuityInfo.eligible) {
     lines.push({ kind: "gratuity", label: `Gratuity: ${gratuityInfo.reason}`, amount: gratuityInfo.amount.toFixed(2) });
   }
 
@@ -163,10 +166,12 @@ const computeLines = async (organizationId: string, ctx: Context, lastWorkingDay
   }
 
   // Outstanding loans and advances are recovered in full.
-  const loans = await db
-    .select()
-    .from(recoverables)
-    .where(and(eq(recoverables.organizationId, organizationId), eq(recoverables.userOrganizationId, ctx.membershipId), inArray(recoverables.status, ["disbursed", "active"])));
+  const loans = features.has("loans")
+    ? await db
+        .select()
+        .from(recoverables)
+        .where(and(eq(recoverables.organizationId, organizationId), eq(recoverables.userOrganizationId, ctx.membershipId), inArray(recoverables.status, ["disbursed", "active"])))
+    : [];
   if (loans.length) {
     const paid = await db
       .select({ recoverableId: repayments.recoverableId, amount: repayments.amount })
@@ -180,7 +185,7 @@ const computeLines = async (organizationId: string, ctx: Context, lastWorkingDay
     }
   }
 
-  for (const claim of await loadUnpaidClaims(organizationId, ctx.membershipId)) {
+  for (const claim of features.has("expenses") ? await loadUnpaidClaims(organizationId, ctx.membershipId) : []) {
     lines.push({ kind: "reimbursement", label: `Expense claim: ${CATEGORY_LABELS[claim.category]} (${claim.expenseDate})`, amount: Number(claim.amount).toFixed(2), claimId: claim.id });
   }
 

@@ -10,6 +10,7 @@ import {
 } from "@/drizzle/schema";
 import { ALL_ROLES, countsAsEmployee, OWNER_ROLES, requireRole } from "@/services/access.services";
 import { fail, ok, type ServiceResult } from "@/utils/result";
+import { featureMissingMessage, featuresOf, type PlanFeature } from "@/services/plan-features";
 
 /**
  * Billing access, in order:
@@ -101,6 +102,7 @@ const loadAccessRow = async (organizationId: string) => {
       paidUntil: platformSubscriptionsTable.paidUntil,
       subscriptionStatus: platformSubscriptionsTable.status,
       planName: platformPlansTable.name,
+      planFeatures: platformPlansTable.features,
     })
     .from(organizationsTable)
     .leftJoin(platformSubscriptionsTable, eq(platformSubscriptionsTable.organizationId, organizationsTable.id))
@@ -114,6 +116,16 @@ export const getOrganizationAccess = async (organizationId: string): Promise<Org
   const row = await loadAccessRow(organizationId);
   return row ? computeAccess(row) : null;
 };
+
+/** The features this organization's plan unlocks right now (see plan-features.ts). */
+export const getOrganizationFeatures = async (organizationId: string): Promise<PlanFeature[]> => {
+  const row = await loadAccessRow(organizationId);
+  return row ? featuresOf({ ...row, accessState: computeAccess(row).state }) : [];
+};
+
+/** For work that is not behind a feature's own API path, such as a report or a payroll line. */
+export const requireFeature = async (organizationId: string, feature: PlanFeature): Promise<ServiceResult<null>> =>
+  (await getOrganizationFeatures(organizationId)).includes(feature) ? ok(null) : fail("forbidden", featureMissingMessage(feature));
 
 export const TRIAL_NOT_STARTED_MESSAGE =
   "This workspace is not active yet. The owner can start the 14-day free trial to begin.";
@@ -160,6 +172,8 @@ export const estimatePlanAmount = (
 export type BillingStatus = OrganizationAccess & {
   isOwner: boolean;
   planName: string | null;
+  /** What the plan unlocks; everything during the trial. */
+  features: PlanFeature[];
   /** Owner only. */
   owner?: {
     billableEmployees: number;
@@ -187,10 +201,12 @@ export const getBillingStatus = async (
   const row = await loadAccessRow(organizationId);
   if (!row) return fail("not-found", "Organization not found");
 
+  const computed = computeAccess(row);
   const status: BillingStatus = {
-    ...computeAccess(row),
+    ...computed,
     isOwner: OWNER_ROLES.includes(access.data.role),
     planName: row.planName,
+    features: featuresOf({ ...row, accessState: computed.state }),
   };
   if (!status.isOwner) return ok(status);
 

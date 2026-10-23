@@ -1,4 +1,5 @@
 import { randomInt } from "node:crypto";
+import { ALL_FEATURES, PLAN_FEATURES } from "@/services/plan-features";
 import type { Context } from "hono";
 import { clientIp } from "@/middleware/audit.middleware";
 
@@ -228,6 +229,10 @@ export const listPlatformAuditController = async (c: Context): Promise<Response>
   }
   return sendResponse(c, "success", "Platform audit log fetched", await listPlatformAuditLogs(getActor(c), parsed.data.page, parsed.data.pageSize));
 };
+
+/** The plan checklist: every feature with its label and what it needs. */
+export const listPlanFeaturesController = (c: Context): Response =>
+  sendResponse(c, "success", "Plan features fetched", ALL_FEATURES.map((key) => ({ key, label: PLAN_FEATURES[key].label, requires: PLAN_FEATURES[key].requires })));
 
 export const listPlatformPlansController = async (c: Context): Promise<Response> =>
   sendResponse(c, "success", "Plans fetched", await listPlatformPlans(getActor(c)));

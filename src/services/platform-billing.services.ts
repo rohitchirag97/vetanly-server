@@ -14,6 +14,7 @@ import {
 import type { PlatformActor } from "@/services/platform.services";
 import { recordPlatformEvent } from "@/services/platform.services";
 import db from "@/utils/db";
+import { withRequirements } from "@/services/plan-features";
 import { computeAccess, countBillableEmployees, getOrganizationAccess } from "@/services/billing-access.services";
 
 type PlanInput = {
@@ -59,6 +60,8 @@ export const listPlatformPlans = async (actor: PlatformActor) => {
 export const createPlatformPlan = async (actor: PlatformActor, input: PlanInput) => {
   const [plan] = await db.insert(platformPlansTable).values({
     ...input,
+    // A feature always brings the features it needs, so a plan can never break one of its own.
+    features: withRequirements(input.features),
     description: input.description || null,
     priceAmount: input.priceAmount.toFixed(2),
     overagePrice: input.overagePrice.toFixed(2),
@@ -75,7 +78,7 @@ export const updatePlatformPlan = async (actor: PlatformActor, planId: string, p
   if (patch.billingPeriod !== undefined) values.billingPeriod = patch.billingPeriod;
   if (patch.includedEmployees !== undefined) values.includedEmployees = patch.includedEmployees;
   if (patch.overagePrice !== undefined) values.overagePrice = patch.overagePrice.toFixed(2);
-  if (patch.features !== undefined) values.features = patch.features;
+  if (patch.features !== undefined) values.features = withRequirements(patch.features);
   if (patch.visibility !== undefined) values.visibility = patch.visibility;
   if (patch.isActive !== undefined) values.isActive = patch.isActive;
   const [plan] = await db.update(platformPlansTable).set(values).where(eq(platformPlansTable.id, planId)).returning();

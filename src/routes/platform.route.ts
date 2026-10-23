@@ -24,6 +24,7 @@ import {
   listPlatformAuditController,
   listPlatformInvoicesController,
   listPlatformOrganizationsController,
+  listPlanFeaturesController,
   listPlatformPlansController,
   markPlatformInvoicePaidController,
   platformReauthSendController,
@@ -58,6 +59,7 @@ platformRoutes.post("/organizations/:organizationId/reactivate", ...protect, rea
 platformRoutes.post("/organizations/:organizationId/notes", ...protect, addPlatformNoteController);
 platformRoutes.get("/audit-log", ...protect, listPlatformAuditController);
 platformRoutes.get("/plans", ...protect, listPlatformPlansController);
+platformRoutes.get("/plan-features", ...protect, listPlanFeaturesController);
 platformRoutes.post("/plans", ...protect, createPlatformPlanController);
 platformRoutes.patch("/plans/:planId", ...protect, updatePlatformPlanController);
 platformRoutes.get("/invoices", ...protect, listPlatformInvoicesController);

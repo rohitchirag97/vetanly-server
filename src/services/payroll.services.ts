@@ -25,7 +25,7 @@ import { notify } from "@/services/notification.services";
 import { queueDelivery, sendableChannels } from "@/services/messaging.services";
 import { maskEmail, maskPhone } from "@/services/messaging-template";
 import { deliveryChannels } from "@/services/user.services";
-import { requireFullAccess } from "@/services/billing-access.services";
+import { getOrganizationFeatures, requireFullAccess } from "@/services/billing-access.services";
 import { CATEGORY_LABELS, loadReimbursableClaims, settleClaimsInPayroll } from "@/services/expense.services";
 import { loadPayrollBonuses, settleBonusesInPayroll, type PayrollBonusLine } from "@/services/bonus.services";
 import { loadDeclarationAdjustments } from "@/services/tax-declaration.services";
@@ -202,7 +202,17 @@ export const buildPayrollItems = async (
   input: z.infer<typeof generatePayrollSchema>,
   options: BuildOptions,
 ) => {
-  const settings = await loadSettings(organizationId);
+  // Parts of pay the plan leaves out (statutory, overtime, loans, claims, bonuses) are not worked out at all.
+  const features = new Set(await getOrganizationFeatures(organizationId));
+  options = {
+    ...options,
+    recoverLoans: options.recoverLoans && features.has("loans"),
+    reimburseClaims: options.reimburseClaims && features.has("expenses"),
+    payBonuses: options.payBonuses && features.has("bonus"),
+  };
+  const loaded = await loadSettings(organizationId);
+  // Without overtime, require approval and approve nothing: no overtime minutes are paid.
+  const settings = features.has("overtime") ? loaded : { ...loaded, overtimeApprovalRequired: true };
   const employees = await db
     .select({
       id: memberships.id,
@@ -326,7 +336,7 @@ export const buildPayrollItems = async (
   const alreadyDeducted = new Set(payrollPaid.map((r) => r.recoverableId));
 
   const statutorySettings = (await loadStatutorySettings(organizationId)).calc;
-  const statutoryActive = isStatutoryActive(statutorySettings);
+  const statutoryActive = features.has("statutory") && isStatutoryActive(statutorySettings);
   const [profileMap, ytdMap] = statutoryActive
     ? await Promise.all([
         loadEmployeeStatutoryMap(organizationId),
@@ -338,7 +348,7 @@ export const buildPayrollItems = async (
   // Rotations and day overrides decide which days rostered employees work or have off.
   const roster = await loadRoster(organizationId, input.periodStart, input.periodEnd, payable.map((e) => e.id));
 
-  const approvalRows = settings.overtimeApprovalRequired
+  const approvalRows = settings.overtimeApprovalRequired && features.has("overtime")
     ? await db
         .select({
           userOrganizationId: overtimeApprovalsTable.userOrganizationId,

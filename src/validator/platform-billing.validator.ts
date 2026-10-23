@@ -1,5 +1,7 @@
 import { z } from "zod";
 
+import { ALL_FEATURES } from "@/services/plan-features";
+
 const planFields = {
   name: z.string().trim().min(1).max(100),
   description: z.string().trim().max(500),
@@ -7,7 +9,7 @@ const planFields = {
   billingPeriod: z.enum(["monthly", "annual", "five_year"]),
   includedEmployees: z.coerce.number().int().min(0).max(1_000_000),
   overagePrice: z.coerce.number().finite().min(0).max(1_000_000_000).multipleOf(0.01),
-  features: z.array(z.string().trim().min(1).max(60)).max(30),
+  features: z.array(z.enum(ALL_FEATURES)).max(ALL_FEATURES.length),
   visibility: z.enum(["public", "custom"]),
   isActive: z.boolean(),
 };
@@ -15,7 +17,7 @@ const planFields = {
 export const platformPlanSchema = z.object({
   ...planFields,
   description: planFields.description.optional().default(""),
-  features: planFields.features.default([]),
+  features: planFields.features.default(ALL_FEATURES),
   visibility: planFields.visibility.default("public"),
   isActive: planFields.isActive.default(true),
 });

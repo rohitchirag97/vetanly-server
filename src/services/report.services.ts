@@ -2,6 +2,8 @@ import type { z } from "zod";
 
 import type { Form16Data } from "@/services/form16-pdf";
 import { MANAGER_ROLES, PEOPLE_MANAGER_ROLES, requireRole } from "@/services/access.services";
+import { requireFeature } from "@/services/billing-access.services";
+import type { PlanFeature } from "@/services/plan-features";
 import { getDailyAttendance } from "@/services/attendance.services";
 import { listLeaveRequests } from "@/services/leave.services";
 import { getRun } from "@/services/payroll.services";
@@ -42,6 +44,21 @@ const hours = (minutes: number | null) => (minutes === null ? "" : (minutes / 60
 const sum = (rows: ReportCell[][], index: number) =>
   rows.reduce((total, row) => total + (Number(row[index]) || 0), 0);
 
+const REPORT_FEATURE: Record<z.infer<typeof reportQuerySchema>["type"], PlanFeature> = {
+  attendance: "attendance",
+  muster: "attendance",
+  leave: "leave",
+  payroll: "payroll",
+  bank: "payroll",
+  wages: "payroll",
+  loans: "loans",
+  pf: "statutory",
+  esi: "statutory",
+  pt: "statutory",
+  tds: "statutory",
+  form16: "statutory",
+};
+
 export const buildReport = async (
   organizationId: string,
   requesterId: string,
@@ -54,6 +71,8 @@ export const buildReport = async (
     peopleReport ? PEOPLE_MANAGER_ROLES : MANAGER_ROLES,
   );
   if (!access.ok) return access;
+  const feature = await requireFeature(organizationId, REPORT_FEATURE[query.type]);
+  if (!feature.ok) return feature;
   const organizationName = await db_organizationName(organizationId);
   const range = `${query.from} to ${query.to}`;
 
