@@ -27,7 +27,7 @@ import { eachDate, workedAfterBreak } from "@/services/payroll-calc";
 import { createLeaveRequest, updateLeaveStatus } from "@/services/leave.services";
 import { holidayDatesBetween, holidaysForBranch } from "@/services/holiday.services";
 import { checkGeofence } from "@/services/geofence";
-import { parseWeeklyOff } from "@/services/payroll-settings.services";
+import { isAdminAttendanceEditEnabled, parseWeeklyOff } from "@/services/payroll-settings.services";
 import { enqueueAttendance } from "@/queue/producer/recordAttendance";
 import { loadRoster } from "@/services/roster.services";
 import { type ShiftTimes, workDateOf } from "@/services/work-day";
@@ -505,6 +505,12 @@ export const recordBulkManualAttendance = async (
   return ok(results);
 };
 
+/** Whether the requester may set others' attendance directly (people managers, when the setting is on). */
+export const canEditAttendance = async (organizationId: string, requesterId: string) => {
+  const access = await requireRole(organizationId, requesterId, PEOPLE_MANAGER_ROLES);
+  return access.ok && (await isAdminAttendanceEditEnabled(organizationId));
+};
+
 /** Daily attendance query, narrowed by role and branches after authorization. */
 type DailyQuery = z.infer<typeof dailyAttendanceQuerySchema> & { employeeRole?: string; branchIds?: string[] };
 
@@ -733,6 +739,7 @@ export const computeDailyAttendance = async (
         lname: usersTable.lname,
         eventType: attendanceLogsTable.eventType,
         occurredAt: attendanceLogsTable.occurredAt,
+        recordedAt: attendanceLogsTable.recordedAt,
         source: attendanceLogsTable.source,
       })
       .from(attendanceLogsTable)
@@ -773,7 +780,8 @@ export const computeDailyAttendance = async (
   };
 
   const days = new Map<string, DailyAttendance>();
-  const punches = new Map<string, { firstIn: Date | null; lastOut: Date | null; fixedIn: Date | null; fixedOut: Date | null }>();
+  type Fixed = { at: Date; recordedAt: Date } | null;
+  const punches = new Map<string, { firstIn: Date | null; lastOut: Date | null; fixedIn: Fixed; fixedOut: Fixed }>();
   const shifts = new Map<string, ReturnType<typeof shiftOn>>();
 
   for (const row of rows) {
@@ -798,10 +806,11 @@ export const computeDailyAttendance = async (
       shifts.set(key, shiftOn(row.membershipId, date));
     }
     const punch = punches.get(key)!;
-    // An approved correction replaces the original punch of that type for the day.
+    // An approved correction replaces the original punch of that type for the day; the latest correction wins.
     if (row.source === "regularization") {
-      if (row.eventType === "check_in") punch.fixedIn = row.occurredAt;
-      else punch.fixedOut = row.occurredAt;
+      const fixed = { at: row.occurredAt, recordedAt: row.recordedAt };
+      const slot = row.eventType === "check_in" ? "fixedIn" : "fixedOut";
+      if (!punch[slot] || punch[slot].recordedAt <= row.recordedAt) punch[slot] = fixed;
     }
     if (row.eventType === "check_in") {
       punch.firstIn ??= row.occurredAt;
@@ -814,8 +823,8 @@ export const computeDailyAttendance = async (
 
   for (const [key, day] of days) {
     const punch = punches.get(key)!;
-    const firstIn = punch.fixedIn ?? punch.firstIn;
-    const lastOut = punch.fixedOut ?? punch.lastOut;
+    const firstIn = punch.fixedIn?.at ?? punch.firstIn;
+    const lastOut = punch.fixedOut?.at ?? punch.lastOut;
     const shift = shifts.get(key)!;
     day.firstCheckIn = firstIn;
     day.lastCheckOut = lastOut;

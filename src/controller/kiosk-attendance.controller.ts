@@ -1,6 +1,7 @@
 import type { Context } from "hono";
 
 import {
+  canEditAttendance,
   getDailyAttendance,
   getGpsStatus,
   recordGpsAttendance,
@@ -166,7 +167,8 @@ export const dailyAttendancePageController = withOrganization((c, { organization
     const result = await getDailyAttendance(organizationId, userId, query);
     if (!result.ok) return respond(c, result, "");
     const rows = status ? result.data.filter((day) => day.status === status) : result.data;
-    return respond(c, ok({ rows: rows.slice(offset, offset + limit), total: rows.length }), "Daily attendance fetched");
+    const canEdit = await canEditAttendance(organizationId, userId);
+    return respond(c, ok({ rows: rows.slice(offset, offset + limit), total: rows.length, canEdit }), "Daily attendance fetched");
   }),
 );
 

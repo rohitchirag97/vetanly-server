@@ -199,6 +199,10 @@ const describers: Record<string, Describe> = {
     text: `requested an attendance correction for ${str(body.date) ?? ""}`,
     extra: { note: str(body.reason) },
   }),
+  "POST /regularization/edit": ({ body, t }) => ({
+    text: `edited the attendance of ${who(t)} for ${str(body.date) ?? ""}`,
+    extra: { note: str(body.reason) },
+  }),
   "PATCH /regularization/:requestId/status": ({ body }) => ({
     text: `${str(body.status) ?? "updated"} an attendance correction`,
     extra: { note: str(body.reviewNote) },

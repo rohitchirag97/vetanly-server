@@ -376,6 +376,8 @@ export const organizationPayrollSettingsTable = pgTable(
     autoDeductLoans: boolean("auto_deduct_loans").notNull().default(false),
     paidHolidays: boolean("paid_holidays").notNull().default(false),
     overtimeApprovalRequired: boolean("overtime_approval_required").notNull().default(false),
+    // Lets admins and HR set an employee's check-in and check-out directly, without a correction request.
+    adminAttendanceEdit: boolean("admin_attendance_edit").notNull().default(false),
     // What happens to a day worked on a weekly off or holiday nobody has decided on yet.
     offDayWorkPolicy: varchar("off_day_work_policy", { length: 16 }).$type<OffDayWorkPolicy>().notNull().default("manager"),
     // Pay for that day, in days' wages. For holidays it includes holiday pay already given, so 2 means double wages.

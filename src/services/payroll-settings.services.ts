@@ -26,6 +26,7 @@ type PayrollSettings = {
   autoDeductLoans: boolean;
   paidHolidays: boolean;
   overtimeApprovalRequired: boolean;
+  adminAttendanceEdit: boolean;
   offDayWorkPolicy: OffDayWorkPolicy;
   weeklyOffWorkMultiplier: string;
   holidayWorkMultiplier: string;
@@ -64,12 +65,23 @@ const columns = {
   autoDeductLoans: organizationPayrollSettingsTable.autoDeductLoans,
   paidHolidays: organizationPayrollSettingsTable.paidHolidays,
   overtimeApprovalRequired: organizationPayrollSettingsTable.overtimeApprovalRequired,
+  adminAttendanceEdit: organizationPayrollSettingsTable.adminAttendanceEdit,
   offDayWorkPolicy: organizationPayrollSettingsTable.offDayWorkPolicy,
   weeklyOffWorkMultiplier: organizationPayrollSettingsTable.weeklyOffWorkMultiplier,
   holidayWorkMultiplier: organizationPayrollSettingsTable.holidayWorkMultiplier,
   fullDayThresholdPercent: organizationPayrollSettingsTable.fullDayThresholdPercent,
   halfDayThresholdPercent: organizationPayrollSettingsTable.halfDayThresholdPercent,
   updatedAt: organizationPayrollSettingsTable.updatedAt,
+};
+
+/** Whether admins and HR may set attendance directly (Payroll settings switch, off by default). */
+export const isAdminAttendanceEditEnabled = async (organizationId: string) => {
+  const [settings] = await db
+    .select({ value: organizationPayrollSettingsTable.adminAttendanceEdit })
+    .from(organizationPayrollSettingsTable)
+    .where(eq(organizationPayrollSettingsTable.organizationId, organizationId))
+    .limit(1);
+  return settings?.value ?? false;
 };
 
 const money = (value: number | null) => (value === null ? null : value.toFixed(2));
@@ -112,6 +124,7 @@ export const savePayrollSettings = async (
     autoDeductLoans: input.autoDeductLoans,
     paidHolidays: input.paidHolidays,
     overtimeApprovalRequired: input.overtimeApprovalRequired,
+    adminAttendanceEdit: input.adminAttendanceEdit,
     offDayWorkPolicy: input.offDayWorkPolicy,
     weeklyOffWorkMultiplier: input.weeklyOffWorkMultiplier.toFixed(2),
     holidayWorkMultiplier: input.holidayWorkMultiplier.toFixed(2),

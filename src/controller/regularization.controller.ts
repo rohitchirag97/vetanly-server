@@ -1,5 +1,6 @@
 import {
   createRegularization,
+  editAttendance,
   listRegularizations,
   updateRegularizationStatus,
 } from "@/services/regularization.services";
@@ -7,6 +8,7 @@ import { withBody, withOrganization, withParam, withQuery } from "@/utils/contro
 import { respond } from "@/utils/result";
 import {
   createRegularizationSchema,
+  editAttendanceSchema,
   listRegularizationQuerySchema,
   updateRegularizationStatusSchema,
 } from "@/validator/regularization.validator";
@@ -32,5 +34,11 @@ export const updateRegularizationStatusController = withOrganization((c, { organ
         "Correction updated",
       ),
     ),
+  ),
+);
+
+export const editAttendanceController = withOrganization((c, { organizationId, userId }) =>
+  withBody(c, editAttendanceSchema, async (body) =>
+    respond(c, await editAttendance(organizationId, userId, body), "Attendance updated", 201),
   ),
 );

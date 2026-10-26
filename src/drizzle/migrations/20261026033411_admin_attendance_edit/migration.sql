@@ -1,0 +1,1 @@
+ALTER TABLE "organization_payroll_settings" ADD COLUMN "admin_attendance_edit" boolean DEFAULT false NOT NULL;

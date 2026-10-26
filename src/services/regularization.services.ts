@@ -18,9 +18,11 @@ import {
 } from "@/services/access.services";
 import { insertAttendance } from "@/services/attendance.services";
 import { peopleManagerIds, notify } from "@/services/notification.services";
+import { isAdminAttendanceEditEnabled } from "@/services/payroll-settings.services";
 import { fail, ok, type ServiceResult } from "@/utils/result";
 import type {
   createRegularizationSchema,
+  editAttendanceSchema,
   listRegularizationQuerySchema,
   updateRegularizationStatusSchema,
 } from "@/validator/regularization.validator";
@@ -146,6 +148,101 @@ export const createRegularization = async (
     body: `${request.date}: ${input.reason}`,
     link: "/attendance/regularization",
   });
+  return ok(request);
+};
+
+/**
+ * An admin or HR sets an employee's check-in and/or check-out for a day without a request,
+ * when the organization allows it. Stored as an already-approved correction, so the change is
+ * recorded with who made it and replaces the day's original punches the same way.
+ */
+export const editAttendance = async (
+  organizationId: string,
+  requesterId: string,
+  input: z.infer<typeof editAttendanceSchema>,
+): Promise<ServiceResult<Regularization>> => {
+  const access = await requireRole(organizationId, requesterId, PEOPLE_MANAGER_ROLES);
+  if (!access.ok) return access;
+  if (!(await isAdminAttendanceEditEnabled(organizationId))) {
+    return fail("forbidden", "Direct attendance editing is turned off in Payroll settings");
+  }
+
+  const membership = await getEmployeeMembership(organizationId, input.employeeId);
+  if (!membership || !membership.isActive) return fail("not-found", "Employee not found");
+  if (!canManageMember(access.data, membership)) return fail("forbidden");
+  const isSuper = access.data.role === UserRole.SUPER_ADMIN;
+  if (input.employeeId === requesterId && !isSuper) {
+    return fail("forbidden", "You cannot edit your own attendance");
+  }
+
+  const checkIn = input.checkIn ? toInstant(input.date, input.checkIn, input.utcOffsetMinutes) : null;
+  const checkOut = input.checkOut ? toInstant(input.date, input.checkOut, input.utcOffsetMinutes) : null;
+  if ([checkIn, checkOut].some((value) => value && value.getTime() > Date.now())) {
+    return fail("invalid", "Punch time cannot be in the future");
+  }
+
+  const [leave] = await db
+    .select({ id: leaveRequestsTable.id })
+    .from(leaveRequestsTable)
+    .where(
+      and(
+        eq(leaveRequestsTable.userOrganizationId, membership.id),
+        eq(leaveRequestsTable.status, "approved"),
+        eq(leaveRequestsTable.isHalfDay, false),
+        lte(leaveRequestsTable.startDate, input.date),
+        gte(leaveRequestsTable.endDate, input.date),
+      ),
+    )
+    .limit(1);
+  if (leave) return fail("conflict", "This employee is on approved leave on that date");
+
+  const now = new Date();
+  const [created] = await db
+    .insert(requests)
+    .values({
+      organizationId,
+      userOrganizationId: membership.id,
+      date: input.date,
+      requestedCheckIn: checkIn,
+      requestedCheckOut: checkOut,
+      reason: input.reason ?? "Edited by an administrator",
+      status: "approved",
+      reviewedByUserId: requesterId,
+      reviewedAt: now,
+    })
+    .returning({ id: requests.id });
+
+  for (const punch of [
+    { eventType: "check_in" as const, at: checkIn },
+    { eventType: "check_out" as const, at: checkOut },
+  ]) {
+    if (!punch.at) continue;
+    await insertAttendance({
+      organizationId,
+      userOrganizationId: membership.id,
+      source: "regularization",
+      eventType: punch.eventType,
+      occurredAt: punch.at.toISOString(),
+    });
+  }
+
+  const request = await loadOne(organizationId, created.id);
+  if (!request) return fail("not-found");
+  if (input.employeeId !== requesterId) {
+    await notify({
+      organizationId,
+      userIds: [input.employeeId],
+      type: "attendance_edited",
+      title: "Your attendance was updated by an administrator",
+      body: [
+        request.date,
+        input.checkIn && `in ${input.checkIn}`,
+        input.checkOut && `out ${input.checkOut}`,
+        input.reason,
+      ].filter(Boolean).join(" — "),
+      link: "/attendance/my",
+    });
+  }
   return ok(request);
 };
 
